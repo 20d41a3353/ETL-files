@@ -1,0 +1,592 @@
+from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.sql.functions import col, lit, current_timestamp, coalesce, when, substring, expr,concat, to_date,count ,to_json ,struct
+from pyspark.sql.functions import collect_list, struct, to_json, sum , broadcast
+import traceback
+from confluent_kafka import Producer
+import sys
+import math
+from datetime import date,timedelta, datetime
+from pyspark.sql.functions import desc
+from py4j.java_gateway import java_import
+# =========== Common Methods =============================
+from common.properties import get_oracle_properties
+from common.dateUtil import get_etl_date
+from common.fileUtil import paths_for_read
+from common.processRun import get_run_id
+from common.logger import setup_logger
+from common.fileUtil import get_hdfs_base
+from common.createSpark import create_spark_session
+from common.fileUtil import tables_to_read
+from common.read_write_oracle import read_oracle
+from common.read_write_oracle import write_oracle
+from common.log_etl_modified import log_etl
+# from common.log_etl_modified1 import log_etl
+from common.processRun import get_process_run_id
+import common.constants  as constants
+
+ 
+def main(args):
+    
+    try:
+        HDFS_BASE = get_hdfs_base()
+ 
+        spark = create_spark_session("[Difference Pipeline]", HDFS_BASE)
+    #============================ CONFIG & DATE ============================
+ 
+       
+        spark.conf.set("spark.sql.adaptive.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        spark.conf.set("spark.sql.shuffle.partitions", "400")
+        spark.conf.set("spark.sql.files.maxPartitionBytes", "256MB")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+ 
+        oracle_properties=get_oracle_properties()
+        # print(oracle_properties)
+        today = get_etl_date(spark)
+        # today = datetime.strptime('2026-01-30 00:00:00', "%Y-%m-%d %H:%M:%S")
+        # today = str(today)
+        print(today)
+        yesterday = today - timedelta(days=1)
+        spark_date = today.strftime("%Y-%m-%d")
+        print(spark_date)
+        PROCESS_ID= getattr(constants,"DIFFERENCE_PIPELINE_ID",3)
+        process_run_id = sys.argv[1] if len(sys.argv) > 1 else get_process_run_id(spark,PROCESS_ID,spark_date)
+        run_id = get_run_id(spark,spark_date,PROCESS_ID)
+        logger = setup_logger("difference",run_id,spark_date)
+        log_etl(spark, process_run_id, "difference_started",1,"difference pipeline started.")
+        logger.info(f"Difference pipeline job strated | run_id={run_id}")
+         
+ 
+        posting_date_str = today.strftime("%Y-%m-%d")
+        today_str = today.strftime("%Y%m%d")
+ 
+        yesterday=yesterday.strftime("%Y-%m-%d")
+ 
+        print(f"=== Using current date for POST_DATE: {posting_date_str} ===")
+              
+        RECON_DATE = today.strftime("%Y-%m-%d") 
+             
+        hdfs_paths = paths_for_read("difference", today, today_str)
+        
+        DIFFERENCE_DATALAKE_PATH = hdfs_paths["DIFFERENCE_DATALAKE_PATH"]
+        CBS_DATALAKE_PATH = hdfs_paths["CBS_DATALAKE_PATH"]
+        GL_DATALAKE_PATH = hdfs_paths["GL_DATALAKE_PATH"]
+        REPORTS_PATH=hdfs_paths["REPORTS"]
+        logger.info(f"{DIFFERENCE_DATALAKE_PATH}")
+        logger.info(f"{CBS_DATALAKE_PATH}")
+        logger.info(f"{GL_DATALAKE_PATH}")
+        logger.info(f"Reports path:{REPORTS_PATH}")
+        
+        # PIPE_SEPARATED_PATH = hdfs_paths["PIPE_SEPARATED_PATH"]
+        TABLES = tables_to_read("difference")
+        DIFFERENCE = TABLES["DIFFERENCE"]
+        GL_BALANCE = TABLES["GL_BALANCE"]
+        CBS_BALANCE = TABLES["CBS_BALANCE"]
+ 
+        gldf=0
+        try:
+            log_etl(spark, process_run_id, "GL_DATALAKE_READING", 1, "In difference GL datalake reading started")
+            
+            df_gl = spark.read.format("delta").load(GL_DATALAKE_PATH).filter(col("BALANCE_DATE") == RECON_DATE)
+            gldf=1
+            df_gl = df_gl.select(col("closing_balance").cast("decimal(25,4)").alias("GL_BALANCE"),col("GLCC"))
+            
+        except Exception as e:
+            logger.error(f"error {e} while reading from datalake")
+            log_etl(spark, process_run_id, "GL_DATALAKE_READING", 3, "In difference GL datalake reading failed")
+            try:
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING",1,"In difference GL_BALANCE oracle reading started")
+                prev_subq = f"""(SELECT BRANCH_CODE || '' || CURRENCY || '' || CGL AS GLCC, 
+                BALANCE AS GL_BALANCE FROM {GL_BALANCE} 
+                WHERE BALANCE_DATE = to_date('{RECON_DATE}','yyyy-mm-dd') ) tmp_prev"""
+                df_gl = read_oracle(spark,prev_subq)
+                
+            except Exception as e:
+                logger.error(f"error {e} while reading from datalake")
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING", 3, "In difference GL_BALANCE oracle reading failed")
+                df_gl=spark.createDataFrame([],schema="""GLCC STRING, GL_BALANCE DECIMAL(25,4)""")
+                logger.info(f"GLIF Data not found")
+                spark.stop()
+        
+ 
+ 
+       
+        df_gl2 = df_gl.select("GLCC", "GL_BALANCE").withColumn(
+            "CBS_BALANCE", F.lit(0).cast(T.DecimalType(25, 4))
+        )
+        cbsdf=0
+        try:
+           
+            log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 1, "In difference CBS datalake reading started")
+            df_cbs = spark.read.format("delta").load(CBS_DATALAKE_PATH).filter(col("BALANCE_DATE") == RECON_DATE)
+            cbsdf=1          
+            df_cbs = df_cbs.select(col("closing_balance").cast("decimal(25,4)").alias("CBS_BALANCE"),col("GLCC"))
+        except Exception as e:
+            logger.error(f"error {e} while reading from datalake")
+            log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 3, "In difference CBS datalake reading failed")
+            try:
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING",1,"In difference CBS_BALANCE oracle reading started")
+                prev_subq = f"""(SELECT BRANCH_CODE || '' || CURRENCY || '' || CGL AS GLCC, 
+                BALANCE CBS_BALANCE FROM {CBS_BALANCE} 
+                WHERE BALANCE_DATE = to_date('{RECON_DATE}','yyyy-mm-dd') ) tmp_prev"""
+                df_cbs =  read_oracle(spark,prev_subq)
+                
+            except Exception as e:
+                logger.error(f"error {e} while reading from datalake")
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING", 3, "In difference CBS_BALANCE oracle reading failed")
+                df_cbs=spark.createDataFrame([],schema="""GLCC STRING, GL_BALANCE DECIMAL(25,4)""")
+                logger.info(f"CBS Data not found")
+                spark.stop()
+                
+       
+ 
+        df_cbs2 = df_cbs.select("GLCC", "CBS_BALANCE").withColumn(
+            "GL_BALANCE", F.lit(0).cast(T.DecimalType(25, 4))
+        )
+       
+        union_df = df_gl2.unionByName(df_cbs2)
+ 
+       
+        df_raw = (
+            union_df.groupBy("GLCC")
+            .agg(
+                F.sum("cbs_balance").alias("cbs_balance"),
+                F.sum("gl_balance").alias("gl_balance"),
+            )
+            .withColumn("today_difference", F.col("cbs_balance") - F.col("gl_balance"))
+            .select("GLCC", "cbs_balance", "gl_balance", "today_difference").filter(col("today_difference") != 0)
+        )
+       
+        df_raw.show(20,False)
+        prevDiff=0
+        try:
+            log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 1, "In difference datalake reading started")
+            df_prev = spark.read.format("delta").load(DIFFERENCE_DATALAKE_PATH).filter(col("RECON_DATE") == yesterday)
+            df_prev = df_prev.select(col("DIFFERENCE_AMOUNT").cast("decimal(25,4)").alias("YESTERDAY_DIFFERENCE"),col("GLCC"),col("FIRST_ERROR_DATE"))
+            prevDiff=1
+                       
+        except Exception as e:
+            logger.error(f"error {e} while reading from datalake")
+            log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 3, "In difference datalake reading failed")
+            try:
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",1,"difference table oracle reading started")
+                prev_subq = f"""(SELECT BRANCH_CODE || '' || CURRENCY || '' || CGL AS GLCC,
+                DIFFERENCE_AMOUNT YESTERDAY_DIFFERENCE,
+                FIRST_ERROR_DATE FROM {DIFFERENCE}
+                WHERE RECON_RUN_DATE = to_date('{yesterday}','yyyy-mm-dd') ) tmp_prev"""
+                df_prev =  read_oracle(spark,prev_subq)
+                
+            except Exception as e:
+                logger.error(f"error {e} while reading from datalake")
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",3,"difference table oracle reading failed")
+                df_prev=spark.createDataFrame([],schema="""GLCC STRING, YESTERDAY_DIFFERENCE DECIMAL(25,4), FIRST_ERROR_DATE DATE""")
+                logger.info(f"Difference Data not found")
+                spark.stop()
+                
+        df_joined = (
+            df_raw.join(df_prev, on="GLCC", how="left")
+            .withColumn(
+                "DIFF_BW_YESTERDAY",
+                F.coalesce(F.col("today_difference"), F.lit(0.0))
+                - F.coalesce(F.col("YESTERDAY_DIFFERENCE"), F.lit(0.0)),
+            )
+            .withColumn(
+                "type",
+                when(col("YESTERDAY_DIFFERENCE").isNull(), "New Entry")
+                .when(
+                    col("today_difference") == col("YESTERDAY_DIFFERENCE"),
+                    "Zero Difference",
+                )
+                .when(
+                    col("today_difference") != col("YESTERDAY_DIFFERENCE"),
+                    "Difference Change",
+                )
+                .otherwise("INCORRECT"),
+            ).withColumn(
+                 "FIRST_ERROR_DATE",
+                 F.when(
+                     F.col("type") == "New Entry",
+                     F.to_date(F.lit(RECON_DATE))
+                 ).otherwise(
+                     F.col("first_error_date")   # keep old date
+                 )
+                  )
+                 )
+        df_split = (
+            df_joined
+            .withColumn("branch_code", (substring(col("GLCC"), 0, 5))) \
+            .withColumn("currency", (substring(col("GLCC"), 6, 3))) \
+            .withColumn("cgl", (substring(col("GLCC"), 9, 10))) \
+            .withColumn("RECON_RUN_DATE", F.to_date(F.lit(RECON_DATE)))
+            .select(
+                "RECON_RUN_DATE",
+                "branch_code",
+                "currency",
+                "cgl",
+                "gl_balance",
+                "cbs_balance",
+                col("today_difference").alias("DIFFERENCE_AMOUNT"),
+                "DIFF_BW_YESTERDAY",
+                "type",
+                "FIRST_ERROR_DATE"
+            )
+        )
+ 
+        df_split.cache()
+        head_rules = [
+            (F.col("BRANCH_CODE") == "01999", "CAO"),
+            # Original substring was fine:
+            (F.substring(F.col("CGL"), 9, 1) == "9", "PROVISION"),
+            # Changed F.left to F.substring:
+            (F.substring(F.col("CGL"), 1, 4) == "1204", "CASH"),
+            (F.substring(F.col("CGL"), 1, 2) == "62", "AUCA"),
+            (F.substring(F.col("CGL"), 1, 4) == "6363", "CTA 6363"),
+            # Nested condition for CGL starting with '4', changed F.left to F.substring:
+            (
+                F.substring(F.col("CGL"), 1, 1) == "4",
+                F.when(F.substring(F.col("CGL"), 1, 4) == "4363", "CTA 4363").otherwise(
+                    "CTA"
+                ),
+            ),
+            (F.substring(F.col("CGL"), 1, 1) == "6", "CTA"),
+            (F.substring(F.col("CGL"), 1, 1) == "7", "I/E"),
+            (F.substring(F.col("CGL"), 1, 1) == "8", "I/E"),
+            # Nested condition for CGL starting with '5', changed F.left to F.substring:
+            (
+                F.substring(F.col("CGL"), 1, 1) == "5",
+                F.when(F.col("CURRENCY") == "INR", "MEMO").otherwise("FC MEMO"),
+            ),
+            # Nested condition for CGL starting with '2148', changed F.left to F.substring:
+            (
+                F.substring(F.col("CGL"), 1, 4) == "2148",
+                F.when(F.col("CURRENCY") == "INR", "BGL").otherwise("FC"),
+            ),
+            (F.substring(F.col("CGL"), 1, 4) == "2249", "INCA"),
+            (F.substring(F.col("CGL"), 1, 4) == "2111", "PPF"),
+            (F.substring(F.col("CGL"), 1, 4) == "2115", "PPF"),
+            (F.substring(F.col("CGL"), 1, 4) == "2060", "PPF"),
+            # Complex condition for CGL '1106505002'.
+            (
+                F.col("CGL") == "1106505002",
+                F.when(
+                    F.col("BRANCH_CODE").isin(
+                        [
+                            "03973",
+                            "03974",
+                            "03975",
+                            "03976",
+                            "04030",
+                            "04425",
+                            "04454",
+                            "06939",
+                        ]
+                    ),
+                    "LHO",
+                ).otherwise("BCGA"),
+            ),
+            (F.col("CGL") == "1000505003", "MIGRATION"),
+            (F.col("CGL") == "1100505001", "LHO"),
+            # Nested condition for CGL starting with '1', changed F.left to F.substring:
+            (
+                F.substring(F.col("CGL"), 1, 1) == "1",
+                F.when(F.col("CURRENCY") == "INR", "LOAN").otherwise("FC"),
+            ),
+        ]
+ 
+        head_column = None
+        for condition, result in head_rules:
+            if head_column is None:
+                head_column = when(condition, result)
+            else:
+                head_column = head_column.when(condition, result)
+ 
+        head_column = head_column.otherwise(
+            F.when(F.col("CURRENCY") == "INR", "DEPOSITS").otherwise("FC")
+        )
+ 
+        final_df = df_split.withColumn("HEAD", head_column)
+        final_df.show(20,False)
+        
+        # ==================================================================
+        # ==================================================================
+        # ==================================================================
+        
+        try:
+            log_etl(spark, process_run_id, "CGL_MASTER_READING", 1, "Selecting the CGL number from CGL_MASTER started.")
+            cgl_query = f"""
+            (
+                SELECT CGL_NUMBER FROM CGL_MASTER where BAL_COMPARE = 1
+            ) T1
+            """            
+            cgl_list =  read_oracle(spark,cgl_query)
+            
+        except Exception as e:
+            logger.error(f"Error {e} while fetching the branchlist from Oracle Table.")
+            log_etl(spark, process_run_id, "CGL_MASTER_READING", 3, "error while fetching the branchlist from Oracle Table.")
+
+        df_validated_branch = final_df.join(
+            broadcast(cgl_list.select(col("CGL_NUMBER").alias("CGL")).withColumn("IS_VALID_BRANCH", lit(1))),
+            on="CGL",
+            how="left"
+        )
+
+       
+        final_df = df_validated_branch.filter(col("IS_VALID_BRANCH").isNotNull()).select(
+                "RECON_RUN_DATE",
+                "branch_code",
+                "currency",
+                "cgl",
+                "gl_balance",
+                "cbs_balance",
+                "DIFFERENCE_AMOUNT",
+                "DIFF_BW_YESTERDAY",
+                "type",
+                "HEAD",
+                "FIRST_ERROR_DATE"
+            )
+        # ==================================================================
+        # ==================================================================
+        # ==================================================================
+        
+        final_df.cache()
+        
+        try:
+            log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_WRITING", 1, "Writing data to DIFFERENCE table started.")
+            write_oracle(final_df,DIFFERENCE) 
+            if(gldf==1):
+                logger.info(f"GLIF Data loaded from datalake path {GL_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "GL_DATALAKE_READING", 2, "In difference GLIF Data loaded from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING",2,"In difference GL_BALANCE oracle reading completed")
+                logger.info(f"GLIF Data loaded from {GL_BALANCE} Oracle Table")
+            if(cbsdf==1):
+                logger.info(f"CBS Data loaded from datalake path {CBS_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 2, "In difference CBS Data loaded from datalake path ") 
+            else:
+                logger.info(f"CBS Data loaded from {CBS_BALANCE} Oracle Table")
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING", 2, "In difference CBS_BALANCE oracle reading completed")
+            if(prevDiff==1):
+                logger.info(f"Difference Data loaded from datalake path {DIFFERENCE_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 2, "In difference Data loaded from datalake path ")
+            else:
+                logger.info(f"DIFFERENCE Data loaded from {DIFFERENCE} Oracle Table")
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",2,"difference table oracle reading complted")
+            logger.info(f"Data loaded into Difference Table.")
+            log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_WRITING", 2, "Data successfully written to DIFFERENCE table.")
+            logger.info(f"Branch list loaded successfully")
+            log_etl(spark, process_run_id, "CGL_MASTER_READING", 2, "Branch list loaded successfully.")         
+            # producer= Producer({"bootstrap.servers":"10.0.19.123:9092"})
+            # producer.produce("pipeline-events","Diffrence")
+            # producer.flush()
+            log_etl(spark, process_run_id, "difference_started",2,"difference pipeline Completed.")
+            
+        except Exception as e:
+            logger.error(f"error while wrtitng in db  {e}")
+            log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_WRITING", 3, f"ETL step failed while difference data writing to oracle")
+            if(gldf==1):
+                
+                log_etl(spark, process_run_id, "GL_DATALAKE_READING", 3, "Error In difference GLIF Data loaded from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING",3,"Error difference GL_BALANCE oracle reading")
+                
+            if(cbsdf==1):
+                log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 3, "Error In difference CBS Data loaded from datalake path ") 
+            else:
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING",3, "Error In difference CBS_BALANCE oracle reading")
+            if(prevDiff==1):
+                log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 3, "Error In difference Data loading from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",3," eror in difference table oracle reading ")
+            
+            log_etl(spark, process_run_id, "CGL_MASTER_READING",3, "Error in Branch list loading")  
+            log_etl(spark, process_run_id, "difference_started",3,"Error in diffrence pipline")
+            spark.stop()
+         
+        
+        etl_date_str = today.strftime("%Y-%m-%d")  
+        base_reports_path = REPORTS_PATH
+        final_folder_path = f"{base_reports_path}/{etl_date_str}"
+        temp_folder_path = f"{final_folder_path}/_tmp_balance_compare_{run_id}"
+        final_file_name = f"balance_compare_{run_id}.csv"
+        final_file_path = f"{final_folder_path}/{final_file_name}" 
+        logger.info(f"File path:{final_file_path}")    
+     
+        
+        # if final_df.rdd.isEmpty():
+        #     raise ValueError("DataFrame is empty, cannot write CSV.")
+    
+        # try:
+        #     final_df.coalesce(1) \
+        #         .write \
+        #         .format("csv") \
+        #         .option("delimiter", "|") \
+        #         .option("header", "true") \
+        #         .mode("overwrite") \
+        #         .save(temp_folder_path)
+        #     print("Temp CSV written successfully.")
+        # except Exception as e:
+        #     raise RuntimeError(f"CSV write failed: {e}")
+        
+        # try:
+        #     java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+        #     java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+
+        #     # fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+        #     # Path = spark._jvm.Path
+
+        #     # # Ensure ETL date folder exists
+        #     # folder_path = Path(final_folder_path)
+        #     # if not fs.exists(folder_path):
+        #     #     fs.mkdirs(folder_path)
+
+        #     # # Find and rename part file
+        #     # temp_path = Path(temp_folder_path)
+        #     # files = fs.listStatus(temp_path)
+
+        #     # renamed = False
+        #     # for file in files:
+        #     #     name = file.getPath().getName()
+        #     #     if name.startswith("part-") and name.endswith(".csv"):
+        #     #         if fs.rename(file.getPath(), Path(final_file_path)):
+        #     #             renamed = True
+        #     #             break
+
+        #     # if not renamed:
+        #     #     raise FileNotFoundError("No part file found to rename.")
+
+        #     # # Delete temp folder
+        #     # fs.delete(temp_path, True)
+
+        #     # logger.info(f"Final CSV created at: {final_file_path}")
+            
+        #     fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+        #     Path = spark._jvm.Path
+
+        #     temp_path = Path(temp_folder_path)
+
+        #     part_file_path = None
+
+        #     def find_part_file(path):
+        #         statuses = fs.listStatus(path)
+        #         for status in statuses:
+        #             if status.isFile():
+        #                 name = status.getPath().getName()
+        #                 if name.startswith("part-") and name.endswith(".csv"):
+        #                     return status.getPath()
+        #             elif status.isDirectory():
+        #                 result = find_part_file(status.getPath())
+        #                 if result:
+        #                     return result
+        #         return None
+
+        #     part_file_path = find_part_file(temp_path)
+
+        #     if part_file_path is None:
+        #         raise FileNotFoundError("No part file found anywhere in temp folder.")
+
+        #     if fs.exists(Path(final_file_path)):
+        #         fs.delete(Path(final_file_path), False)
+
+        #     fs.rename(part_file_path, Path(final_file_path))
+        #     fs.delete(temp_path, True)
+
+        # except Exception as e:
+        #     logger.error(f"Failed to rename or move file: {e}")
+        #     raise 
+        
+          
+        
+        
+        dl_df=final_df.select(col("RECON_RUN_DATE").alias("RECON_DATE"),(concat(col("BRANCH_CODE"),col("CURRENCY"),col("CGL")).alias("GLCC")),col("DIFFERENCE_AMOUNT").cast("decimal(25,4)"))
+        log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_WRITING", 1, "Writing data to DIFFERENCE datalake started.")
+        try:
+            dl_df.write \
+                .format("delta") \
+                .mode("append") \
+                .save(DIFFERENCE_DATALAKE_PATH)
+            if(gldf==1):
+                logger.info(f"GLIF Data loaded from datalake path {GL_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "GL_DATALAKE_READING", 2, " GLIF Data loaded from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING",2," GL_BALANCE oracle reading completed")
+                logger.info(f"GLIF Data loaded from {GL_BALANCE} Oracle Table")
+            if(cbsdf==1):
+                logger.info(f"CBS Data loaded from datalake path {CBS_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 2, " CBS Data loaded from datalake path ") 
+            else:
+                logger.info(f"CBS Data loaded from {CBS_BALANCE} Oracle Table")
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING", 2, "CBS_BALANCE oracle reading completed")
+            if(prevDiff==1):
+                logger.info(f"Difference Data loaded from datalake path {DIFFERENCE_DATALAKE_PATH}")
+                log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 2, "difference Data loaded from datalake path ")
+            else:
+                logger.info(f"DIFFERENCE Data loaded from {DIFFERENCE} Oracle Table")
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",2,"difference table oracle reading complted")
+            logger.info(f"Branch list loaded successfully")
+            log_etl(spark, process_run_id, "CGL_MASTER_READING", 2, "Branch list loaded successfully.")   
+            log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_WRITING", 2, "Data successfully written to DIFFERENCE datalake.")
+            
+        except Exception as e:
+            if(gldf==1):
+                
+                log_etl(spark, process_run_id, "GL_DATALAKE_READING", 3, "Error In difference GLIF Data loaded from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "GL_BALANCE_ORACLE_READING",3,"Error difference GL_BALANCE oracle reading")
+                
+            if(cbsdf==1):
+                log_etl(spark, process_run_id, "CBS_DATALAKE_READING", 3, "Error In difference CBS Data loaded from datalake path ") 
+            else:
+                log_etl(spark, process_run_id, "CBS_BALANCE_ORACLE_READING",3, "Error In difference CBS_BALANCE oracle reading")
+            if(prevDiff==1):
+                log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_READING", 3, "Error In difference Data loading from datalake path ")
+            else: 
+                log_etl(spark, process_run_id, "DIFFERENCE_ORACLE_READING",3," eror in difference table oracle reading ")
+            
+            log_etl(spark, process_run_id, "CGL_MASTER_READING",3, "Error in Branch list loading")  
+            log_etl(spark, process_run_id, "DIFFERENCE_DATALAKE_WRITING", 3, f"ETL step failed while difference data writing to datake")
+            log_etl(spark, process_run_id, "difference_started",3,"Error in diffrence pipline")
+            spark.stop()
+        nested_summary = (
+           final_df
+           .groupBy("RECON_RUN_DATE","HEAD")
+           .agg(          
+                 count("*").alias("Total_no_of_entries"),
+                 sum(when(col("type") == "New Entry", 1).otherwise(0)).alias("new entry"))
+               ).alias("summary")
+        
+        summary = (
+           nested_summary
+           .groupBy("RECON_RUN_DATE")
+           .agg(
+               collect_list(
+                   struct(
+                       col("HEAD"),
+                       col("Total_no_of_entries"),
+                       col('new entry')
+                   )
+               ).alias("summary")
+           )
+        )
+ 
+        nested_summary_json = summary.select(
+           to_json(struct(col("RECON_RUN_DATE"),col("summary"))).alias("summary_json")
+        )
+        
+        nested_summary_json.show(truncate=False)
+        log_etl(spark, process_run_id, "difference_summarry",2,"Summary for diffrence", nested_summary_json ,0)
+        log_etl(spark, process_run_id, "difference_started",2,"difference pipeline Completed.")
+        logger.info("Difference pipeline completed")
+        spark.stop()
+ 
+    except Exception as e:
+        print("ERROR during reconciliation: " , e)
+        log_etl(spark, process_run_id, "difference_started",3,"Error in diffrence pipline")
+        spark.stop()    
+        sys.exit(1)
+ 
+ 
+if __name__ == "__main__":
+    main(sys.argv)
+ 
+ 
+ 
