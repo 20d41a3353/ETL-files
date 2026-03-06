@@ -1,0 +1,210 @@
+from pyspark.sql import SparkSession , functions as F
+import sys
+# =====================================
+import datetime 
+from pyspark.sql import SparkSession 
+import pyspark.sql.types as T
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
+from pyspark.sql.functions import to_date,expr, round, lower, col,when, length, count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first
+from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType, DateType, TimestampType
+from datetime import date, timedelta
+from pyspark.sql.functions import desc
+import sys
+from py4j.java_gateway import java_import
+from delta.tables import DeltaTable 
+import concurrent.futures
+import builtins
+from pyspark.sql import Row
+import common.constants  as constants
+import re  
+# =====================================
+
+
+# =========== Common Methods =============================
+from common.logger import setup_logger 
+from common.properties import get_oracle_properties
+from common.dateUtil import get_etl_date
+from common.fileUtil import files_to_read
+from common.fileUtil import paths_for_read
+from common.fileUtil import tables_to_read
+from common.processRun import get_run_id
+from common.pattern import read_patterns
+from common.createSpark import create_spark_session
+from common.fileUtil import get_hdfs_base
+from common.check_monthend import check_MonthEnd
+from common.check_monthend import check_MonthEnd_minus1
+from common.check_monthend import check_Previous_MonthEnd
+from common.batch_journal_id import get_batch_id
+from common.batch_journal_id import get_journal_id
+
+from common.Precheck import run_currency_precheck
+from datetime import datetime,date
+
+# from common.log_etl_modified import log_etl
+from common.PPF_FCNB import ppf_postings
+from common.PPF_FCNB import monthend_posting
+from common.read_write_oracle import read_oracle
+from common.read_write_oracle import write_oracle
+from common.provision import process_provision_data
+from common.provision import reverse_provision
+from common.datalake_paths import get_delta_path_by_file_type
+from common.processRun import get_process_run_id
+
+def main():
+    HDFS_BASE = get_hdfs_base()
+    spark = create_spark_session("Profit and Loss Posting", HDFS_BASE)
+    today = get_etl_date(spark)
+    yesterday = today - timedelta(days=1)
+    posting_date_str = today.strftime("%Y%m%d")
+    today_str = posting_date_str
+    yesterday=yesterday.strftime("%Y-%m-%d")
+    today= today.strftime("%Y-%m-%d")
+    PROCESS_ID= getattr(constants,"P_L_POSTING_PIPELINE_ID", 14) 
+    RUN_ID = get_run_id(spark,today,PROCESS_ID) 
+    if(RUN_ID >1):
+        wipe_etl_transactions_sql =f"""()t"""
+    logger = setup_logger("PL_POSTING", RUN_ID , posting_date_str)
+     
+    logger.info(f"=== Using current date for POST_DATE: {posting_date_str} ===")
+    logger.info(f"RUN_ID as : {RUN_ID}")
+
+    logger.info(f"Fetched oracle properties SUCCESFULLY :)")
+    
+    hdfs_paths = paths_for_read("glif",today,today_str) 
+    GL_DATALAKE_PATH = hdfs_paths["GL_DATALAKE_PATH"]
+    oracle_properties=get_oracle_properties()
+
+    oracle_url = oracle_properties["url"]
+    oracle_user = oracle_properties["user"]
+    oracle_password = oracle_properties["password"]
+    oracle_driver = oracle_properties["driver"]
+
+    process_run_id = sys.argv[1] if len(sys.argv) > 1 else get_process_run_id(spark,PROCESS_ID,today)
+
+    # log_etl(spark, process_run_id, "PL_Posting",1)
+    try:
+        load_balance_sql = f"""(select * from P_L_TRANSFER_BALANCE) t1"""
+        load_transactions_sql = f"""(select CGL,CURRENCY,BRANCH_CODE,NARRATION,SOURCE_FLAG,BATCH_ID,DEBIT_AMOUNT,CREDIT_AMOUNT,TRANSACTION_COUNT,JOURNAL_ID,TRANSACTION_DATE from P_L_TRANSFER_TRANSACTIONS) t1"""
+
+# ---------------------------- Load Transactions ---------------------------------------------------
+        # log_etl(spark, process_run_id, "PL_Posting_Loading_Transactions",1)   
+        try:
+            load_transactions = read_oracle(spark,load_transactions_sql)
+            # log_etl(spark, process_run_id, "PL_Posting_Loading_Transactions",2)
+        except Exception as e:
+            print(f"Error {e} while loading data from Transactions Table") 
+            # log_etl(spark, process_run_id, "PL_Posting_Loading_Transactions",3, f"Failed While loading Transactions Reason: {e}.")  
+# ------------------------------ Posting Balances on Oracle -------------------------------------------------            
+        # log_etl(spark, process_run_id, "PL_Posting_Balance",1)
+        try:
+            conn = spark._sc._gateway.jvm.java.sql.DriverManager.getConnection(oracle_url,oracle_user,oracle_password)
+            merge_sql = f"""
+                        MERGE INTO GL_BALANCE_TEST  target
+                        USING  P_L_TRANSFER_BALANCE  source
+                        ON (
+                              target.cgl = source.cgl
+                          AND target.currency = source.currency
+                          AND target.branch_code = source.branch_code
+                          AND target.balance_date = source.balance_date
+                        )
+                        WHEN MATCHED THEN
+                        UPDATE SET
+                           target.balance = NVL(target.balance,0) + source.balance , target.inr_balance = NVL(target.balance,0) + source.balance 
+                        WHEN NOT MATCHED THEN
+                        INSERT (
+                           cgl,
+                           currency,
+                           branch_code,
+                           balance,
+                           inr_balance,
+                           balance_date
+                        )
+                        VALUES (
+                           source.cgl,
+                           source.currency,
+                           source.branch_code,
+                           source.balance,
+                           source.balance,
+                           source.balance_date
+                        )
+                        """  
+            conn.setAutoCommit(False)             
+            statement = conn.createStatement()
+            print("stmt")
+            statement.execute(merge_sql)
+            print("stmt exec")
+            
+            conn.commit()
+            print("comm comit")
+            statement.close()
+            print("stmt close")
+            conn.close()
+            print("conn close")
+            print("MERGE executed successfully")              
+            # log_etl(spark, process_run_id, "PL_Posting_Balance",2)  
+        except Exception as e:    
+            print(f"Error {e} while writing to BALANCE oracle table.")
+
+            # log_etl(spark, process_run_id, "PL_Posting_Balance",3, f"Failed While posting balances Reason: {e}.") 
+
+# ------------------------------- Posting Balances on Data-Lake------------------------------------------------            
+        # log_etl(spark, process_run_id, "PL_Posting_Data_Datalake",1)      
+        try:             
+            source_df = read_oracle(spark, load_balance_sql)
+            source_df = source_df.select(
+               concat(col("BRANCH_CODE"),col("CURRENCY"),col("CGL")).alias("glcc"),
+               col("BALANCE").alias("balance"),
+               col("BALANCE_DATE").alias("balance_date")
+            )
+            source_df.show(10,False)
+            
+            # delta_table = DeltaTable.forPath(spark,GL_DATALAKE_PATH)
+            delta_table = DeltaTable.forPath(
+               spark,
+               "hdfs://10.0.17.76:8020/data-lake/etl-testing/gl_balance" 
+            )
+            # GL_DATALAKE_PATH
+            delta_table.alias("target").merge(
+               source_df.alias("source"),
+               """
+               target.glcc = source.glcc
+               AND target.BALANCE_DATE = source.balance_date
+               """
+            ).whenMatchedUpdate(
+               set={
+                   "closing_balance": "coalesce(target.closing_balance,0) + coalesce(source.balance,0)"
+               }
+            ).whenNotMatchedInsert(
+               values={
+                   "glcc": "source.glcc",
+                   "closing_balance": "source.balance",
+                   "BALANCE_DATE": "source.balance_date"
+               }
+            ).execute()
+            # log_etl(spark, process_run_id, "PL_Posting_Data_Datalake",2, "Successfully posting to Balance Datalake")
+        except Exception as e:    
+            print(f"Error {e} while writing to Datalake.")
+            # log_etl(spark, process_run_id, "PL_Posting_Data_Datalake",3, f"Failed While posting balances to datalake Reason: {e}.")
+# --------------------------------Posting Transactions -----------------------------------------------
+        # log_etl(spark, process_run_id, "PL_Posting_transactions",1)
+        try:
+            write_oracle(load_transactions, "GL_TRANSACTIONS_TEST")
+            # log_etl(spark, process_run_id, "PL_Posting_transactions",2, "Successfully Transfered of Transactions")
+        except Exception as e:    
+            print(f"Error {e} while writing to TRANSACTIONS oracle Table.")
+            # log_etl(spark, process_run_id, "PL_Posting_transactions",3, f"Failed While posting Transactions. Reason: {e}.")
+        # log_etl(spark, process_run_id, "PL_Posting",2,"Profit and Loss Successfully Posted.")
+
+    except Exception as e:
+        print(f"Error {e} while posting Profit and Loss.")  
+        # log_etl(spark, process_run_id, "PL_Posting",3,f"Failed While posting Profit and Loss. Reason {e}.")  
+
+    spark.stop()
+
+
+
+
+if __name__=="__main__":
+    main()
+    # main(sys.argv)   
+    # 
