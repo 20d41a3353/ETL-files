@@ -1,0 +1,153 @@
+import xml.etree.ElementTree as ET
+import urllib.request
+import json
+import socket
+from pyspark.sql import SparkSession
+
+# ── Step 1: Parse hdfs-site.xml to extract all config ───────────────────────
+def parse_hdfs_site(hdfs_site_path="/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml"):
+    """Parse hdfs-site.xml and return all properties as a dict"""
+    tree = ET.parse(hdfs_site_path)
+    root = tree.getroot()
+    config = {}
+    for prop in root.findall("property"):
+        name  = prop.find("name").text.strip()
+        value = prop.find("value").text.strip()
+        config[name] = value
+    return config
+
+# ── Step 2: Extract NameNode HTTP addresses from config ──────────────────────
+def get_namenode_http_addresses(config):
+    """
+    Dynamically extract all NameNode HTTP addresses from hdfs-site.xml config.
+    Returns list of (nn_id, host, port) tuples.
+    Example: [('nn1','nn1',50072), ('nn2','nn2',50072), ('nn3','nn3',50072)]
+    """
+    nameservice   = config.get("dfs.nameservices", "")
+    nn_ids_value  = config.get(f"dfs.ha.namenodes.{nameservice}", "")
+    nn_ids        = [n.strip() for n in nn_ids_value.split(",")]
+
+    namenode_list = []
+    for nn_id in nn_ids:
+        key = f"dfs.namenode.http-address.{nameservice}.{nn_id}"
+        address = config.get(key, "")
+        if address:
+            host, port = address.split(":")
+            namenode_list.append((nn_id, host, int(port)))
+            print(f"  📌 Found NameNode [{nn_id}] → {host}:{port}")
+    return namenode_list
+
+# ── Step 3: Resolve hostname → IP (uses /etc/hosts on jumper server) ─────────
+def resolve_host(hostname):
+    """Resolve hostname using system /etc/hosts or DNS"""
+    try:
+        ip = socket.gethostbyname(hostname)
+        print(f"  🔍 Resolved {hostname} → {ip}")
+        return ip
+    except socket.gaierror as e:
+        print(f"  ⚠️  Cannot resolve hostname '{hostname}': {e}")
+        return None
+
+# ── Step 4: Query JMX to find the ACTIVE NameNode ───────────────────────────
+def find_active_namenode_via_jmx(namenode_list):
+    """
+    Query JMX endpoint for each NameNode.
+    Returns (nn_id, host, ip, port) of the ACTIVE one.
+    """
+    jmx_query = "?qry=Hadoop:service=NameNode,name=NameNodeStatus"
+
+    for (nn_id, host, port) in namenode_list:
+        ip = resolve_host(host)
+        if not ip:
+            print(f"  ❌ Skipping {nn_id} — hostname unresolvable")
+            continue
+
+        url = f"http://{ip}:{port}/jmx{jmx_query}"
+        print(f"\n  🌐 Querying JMX: {url}")
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                data  = json.loads(response.read().decode())
+                beans = data.get("beans", [])
+                if beans:
+                    state = beans[0].get("State", "unknown").lower()
+                    print(f"  📊 {nn_id} ({host}) state → {state.upper()}")
+                    if state == "active":
+                        return {"nn_id": nn_id, "host": host, "ip": ip, "port": port}
+        except Exception as e:
+            print(f"  ⚠️  JMX query failed for {nn_id} ({ip}:{port}): {e}")
+
+    return None
+
+# ── Step 5: Build SparkSession dynamically using resolved active NameNode ────
+def build_spark_session(active_nn: dict, config: dict):
+    """
+    Build SparkSession pointing to the active NameNode.
+    Uses nameservice (HA) config — no hardcoded IPs needed.
+    """
+    nameservice = config.get("dfs.nameservices", "fincorePP")
+
+    builder = SparkSession.builder \
+        .appName("DynamicActiveNameNode") \
+        .config("spark.hadoop.fs.defaultFS", f"hdfs://{nameservice}") \
+        .config(f"spark.hadoop.dfs.nameservices", nameservice) \
+        .config(f"spark.hadoop.dfs.ha.namenodes.{nameservice}",
+                config.get(f"dfs.ha.namenodes.{nameservice}")) \
+        .config(f"spark.hadoop.dfs.client.failover.proxy.provider.{nameservice}",
+                config.get(f"dfs.client.failover.proxy.provider.{nameservice}"))
+
+    # Dynamically inject RPC addresses for all namenodes (no hardcoding)
+    nn_ids = config.get(f"dfs.ha.namenodes.{nameservice}", "").split(",")
+    for nn_id in nn_ids:
+        nn_id = nn_id.strip()
+        rpc_key  = f"dfs.namenode.rpc-address.{nameservice}.{nn_id}"
+        http_key = f"dfs.namenode.http-address.{nameservice}.{nn_id}"
+        if rpc_key  in config:
+            builder = builder.config(f"spark.hadoop.{rpc_key}",  config[rpc_key])
+        if http_key in config:
+            builder = builder.config(f"spark.hadoop.{http_key}", config[http_key])
+
+    return builder.getOrCreate()
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    HDFS_SITE_PATH = "/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml"
+
+    print("=" * 60)
+    print("   DYNAMIC ACTIVE NAMENODE DETECTION (No Hardcoded IPs)")
+    print("=" * 60)
+
+    # 1. Parse XML
+    print("\n[1] Parsing hdfs-site.xml ...")
+    config = parse_hdfs_site(HDFS_SITE_PATH)
+    print(f"  ✅ Nameservice     : {config.get('dfs.nameservices')}")
+    print(f"  ✅ NameNode IDs    : {config.get('dfs.ha.namenodes.fincorePP')}")
+
+    # 2. Extract NN HTTP addresses
+    print("\n[2] Extracting NameNode HTTP addresses ...")
+    namenode_list = get_namenode_http_addresses(config)
+
+    # 3. Find active NN via JMX
+    print("\n[3] Querying JMX to find Active NameNode ...")
+    active_nn = find_active_namenode_via_jmx(namenode_list)
+
+    if not active_nn:
+        print("\n❌ Could not determine active NameNode. Check connectivity.")
+        exit(1)
+
+    print(f"\n🎯 ACTIVE NAMENODE FOUND!")
+    print(f"   ID   : {active_nn['nn_id']}")
+    print(f"   Host : {active_nn['host']}")
+    print(f"   IP   : {active_nn['ip']}")
+    print(f"   Port : {active_nn['port']}")
+
+    # 4. Build Spark Session
+    print("\n[4] Building SparkSession with dynamic NameNode config ...")
+    spark = build_spark_session(active_nn, config)
+    print("  ✅ SparkSession created successfully!")
+
+    # 5. Quick validation
+    print("\n[5] Validating HDFS connectivity ...")
+    df = spark.read.text(f"hdfs://{config['dfs.nameservices']}/")
+    print("  ✅ HDFS is reachable via active NameNode!")
+
+    spark.stop()
