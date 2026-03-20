@@ -1,0 +1,42 @@
+kubectl create configmap hadoop-config \
+  --from-file=hdfs-site.xml=/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml \
+  --from-file=core-site.xml=/media/hadoop-3.4.2/etc/hadoop/core-site.xml \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf
+
+
+
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: active
+  namespace: uat-cbops1
+spec:
+  containers:
+    - name: active
+      image: your-pyspark-image   # your existing image
+      command: ["python3", "/app/Scripts/active_hdfs.py"]
+      volumeMounts:
+        - name: hadoop-config
+          mountPath: /media/hadoop-3.4.2/etc/hadoop   # ← same path your script uses
+          readOnly: true
+  volumes:
+    - name: hadoop-config
+      configMap:
+        name: hadoop-config       # ← ConfigMap we created above
+
+
+
+
+
+
+
+# Delete old pod
+kubectl delete -f active.yaml -n uat-cbops1 --kubeconfig h06vksuatlcbopscls.conf
+
+# Apply new yaml with volume mount
+kubectl apply -f active.yaml -n uat-cbops1 --kubeconfig h06vksuatlcbopscls.conf
+
+# Watch logs
+kubectl logs active -n uat-cbops1 --kubeconfig h06vksuatlcbopscls.conf -f
