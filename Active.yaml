@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: active
+  namespace: uat-cbops1
+spec:
+  restartPolicy: Never
+  containers:
+  - name: spark-py
+    image: h06vksharbor.corp.ad.sbi/cbops/etl:v100
+    imagePullPolicy: Always
+    resources:
+      requests:
+        memory: "10Gi"
+        cpu: "8"
+      limits:
+        memory: "12Gi"
+        cpu: "10"
+    command: ["/opt/spark/bin/spark-submit"]
+    args:
+      - "--master"
+      - "local[*]"
+      - "--name"
+      - "active"
+      - "--driver-memory"
+      - "10g"
+      - "--executor-memory"
+      - "10g"
+      - "--conf"
+      - "spark.driver.maxResultSize=4g"
+      - "--jars"
+      - "/app/Scripts/jars/ojdbc8.jar"
+      - "/app/Scripts/active_hdfs.py"
+    # ── Mount hadoop config files into the pod ──
+    volumeMounts:
+      - name: hadoop-config
+        mountPath: /media/hadoop-3.4.2/etc/hadoop
+        readOnly: true
+
+  volumes:
+    - name: hadoop-config
+      configMap:
+        name: hadoop-config      # ConfigMap created from your XML files
+
+
+
+
+
+# Step 1: Create ConfigMap from XML files on jumper server
+kubectl create configmap hadoop-config \
+  --from-file=hdfs-site.xml=/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml \
+  --from-file=core-site.xml=/media/hadoop-3.4.2/etc/hadoop/core-site.xml \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf
+
+# Step 2: Verify ConfigMap was created
+kubectl describe configmap hadoop-config \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf
+
+# Step 3: Delete old pod
+kubectl delete -f active.yaml \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf
+
+# Step 4: Apply updated yaml
+kubectl apply -f active.yaml \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf
+
+# Step 5: Watch live logs
+kubectl logs active \
+  -n uat-cbops1 \
+  --kubeconfig h06vksuatlcbopscls.conf -f
+
+
