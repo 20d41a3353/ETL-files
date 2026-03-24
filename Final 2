@@ -1,0 +1,356 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: active
+  namespace: uat-cbops1
+spec:
+  restartPolicy: Never
+
+  # ── Give the pod a resolvable hostname ─────────────────────────────────────
+  hostname: active
+  subdomain: spark-pods          # requires a headless service (see below)
+
+  volumes:
+    - name: hadoop-config
+      configMap:
+        name: hadoop-config
+    - name: node-hosts
+      hostPath:
+        path: /etc/hosts
+        type: File
+
+  containers:
+  - name: spark-py
+    image: h06vksharbor.corp.ad.sbi/cbops/etl:v100
+    imagePullPolicy: Always
+    resources:
+      requests:
+        memory: "10Gi"
+        cpu: "8"
+      limits:
+        memory: "12Gi"
+        cpu: "10"
+
+    # ── Tell Spark to use 127.0.0.1 as driver host (local mode fix) ──────────
+    env:
+      - name: MY_POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP   # K8s injects the real pod IP here
+
+    command: ["/opt/spark/bin/spark-submit"]
+    args:
+      - "--master"
+      - "local[*]"
+      - "--name"
+      - "ActiveNameNodeDetection"       # app name only — no hostname conflict
+      - "--driver-memory"
+      - "10g"
+      - "--executor-memory"
+      - "10g"
+      - "--conf"
+      - "spark.driver.maxResultSize=4g"
+      - "--conf"
+      - "spark.driver.host=$(MY_POD_IP)"    # ← KEY FIX: use pod IP not hostname
+      - "--conf"
+      - "spark.driver.bindAddress=0.0.0.0"  # ← bind on all interfaces
+      - "--jars"
+      - "/app/Scripts/jars/ojdbc8.jar"
+      - "/app/Scripts/active_hdfs.py"
+
+    volumeMounts:
+      - name: hadoop-config
+        mountPath: /media/hadoop-3.4.2/etc/hadoop
+        readOnly: true
+      - name: node-hosts
+        mountPath: /etc/hosts
+        readOnly: true
+
+
+
+
+
+
+
+
+
+
+"""
+active_hdfs.py
+Production-grade Active NameNode detection via JMX + PySpark
+"""
+
+import xml.etree.ElementTree as ET
+import urllib.request
+import json
+import socket
+import os
+import sys
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+HDFS_SITE_PATH = "/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml"
+HOSTS_FILE     = "/etc/hosts"
+JMX_TIMEOUT    = 5
+JMX_QUERY      = "?qry=Hadoop:service=NameNode,name=NameNodeStatus"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def parse_xml(path):
+    """Parse Hadoop XML config into dict."""
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+        return {
+            p.find("name").text.strip(): p.find("value").text.strip()
+            for p in root.findall("property")
+        }
+    except FileNotFoundError:
+        print(f"[ERROR] Not found: {path}")
+        print("        Verify ConfigMap is mounted at /media/hadoop-3.4.2/etc/hadoop")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] Parse failed: {e}")
+        sys.exit(1)
+
+
+def load_hosts(path):
+    """Parse /etc/hosts into hostname→IP dict."""
+    mappings = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    for hostname in parts[1:]:
+                        mappings[hostname] = parts[0]
+        print(f"  [OK] {len(mappings)} entries loaded from {path}")
+    except FileNotFoundError:
+        print(f"  [WARN] {path} not found — will use system DNS only")
+    return mappings
+
+
+def resolve(hostname, hosts_map):
+    """Resolve hostname: /etc/hosts dict first, then system DNS."""
+    if hostname in hosts_map:
+        print(f"  [hosts] {hostname} → {hosts_map[hostname]}")
+        return hosts_map[hostname]
+    try:
+        ip = socket.gethostbyname(hostname)
+        print(f"  [dns]   {hostname} → {ip}")
+        return ip
+    except socket.gaierror:
+        print(f"  [FAIL]  Cannot resolve: {hostname}")
+        return None
+
+
+def get_namenodes(config):
+    """Extract (nn_id, host, http_port) list from hdfs-site config."""
+    nameservice = config.get("dfs.nameservices", "").strip()
+    if not nameservice:
+        print("[ERROR] dfs.nameservices missing in hdfs-site.xml")
+        sys.exit(1)
+
+    nn_ids_raw = config.get(f"dfs.ha.namenodes.{nameservice}", "")
+    if not nn_ids_raw:
+        print(f"[ERROR] dfs.ha.namenodes.{nameservice} missing")
+        sys.exit(1)
+
+    namenodes = []
+    for nn_id in [n.strip() for n in nn_ids_raw.split(",")]:
+        key = f"dfs.namenode.http-address.{nameservice}.{nn_id}"
+        addr = config.get(key, "")
+        if not addr:
+            print(f"  [WARN] {key} not found — skipping {nn_id}")
+            continue
+        host, port = addr.split(":")
+        namenodes.append((nn_id, host.strip(), int(port)))
+        print(f"  [OK] {nn_id} → {host}:{port}")
+
+    return nameservice, namenodes
+
+
+def find_active(namenodes, hosts_map):
+    """Query JMX on each NameNode, return the active one."""
+    for (nn_id, host, port) in namenodes:
+        ip = resolve(host, hosts_map)
+        if not ip:
+            continue
+        url = f"http://{ip}:{port}/jmx{JMX_QUERY}"
+        print(f"\n  Querying {nn_id} at {ip}:{port} ...")
+        try:
+            resp  = urllib.request.urlopen(url, timeout=JMX_TIMEOUT)
+            beans = json.loads(resp.read().decode()).get("beans", [])
+            if not beans:
+                print(f"  [WARN] Empty JMX response from {nn_id}")
+                continue
+            state = beans[0].get("State", "unknown").lower()
+            print(f"  [STATE] {nn_id} → {state.upper()}")
+            if state == "active":
+                return {"nn_id": nn_id, "host": host, "ip": ip, "port": port}
+        except urllib.error.URLError as e:
+            print(f"  [FAIL] {nn_id} unreachable: {e.reason}")
+        except Exception as e:
+            print(f"  [FAIL] {nn_id} error: {e}")
+    return None
+
+
+def build_spark_session(nameservice, config):
+    """Build SparkSession with full HA config — zero hardcoded IPs."""
+    from pyspark.sql import SparkSession
+
+    # Get pod IP injected by K8s (set in yaml env: MY_POD_IP)
+    # Falls back to 127.0.0.1 for local testing
+    pod_ip = os.environ.get("MY_POD_IP", "127.0.0.1")
+    print(f"  [OK] Using driver host: {pod_ip}")
+
+    nn_ids = [
+        n.strip()
+        for n in config.get(f"dfs.ha.namenodes.{nameservice}", "").split(",")
+    ]
+
+    builder = (
+        SparkSession.builder
+        .appName("ActiveNameNodeDetection")
+        # ── Driver host fix ───────────────────────────────────────────────────
+        .config("spark.driver.host",        pod_ip)
+        .config("spark.driver.bindAddress", "0.0.0.0")
+        # ── HDFS HA config ────────────────────────────────────────────────────
+        .config("spark.hadoop.fs.defaultFS",
+                f"hdfs://{nameservice}")
+        .config(f"spark.hadoop.dfs.nameservices",
+                nameservice)
+        .config(f"spark.hadoop.dfs.ha.namenodes.{nameservice}",
+                config.get(f"dfs.ha.namenodes.{nameservice}"))
+        .config(f"spark.hadoop.dfs.client.failover.proxy.provider.{nameservice}",
+                config.get(f"dfs.client.failover.proxy.provider.{nameservice}"))
+    )
+
+    # Inject all RPC + HTTP addresses dynamically
+    for nn_id in nn_ids:
+        for addr_type in ("rpc-address", "http-address"):
+            key = f"dfs.namenode.{addr_type}.{nameservice}.{nn_id}"
+            if key in config:
+                builder = builder.config(f"spark.hadoop.{key}", config[key])
+
+    return builder.getOrCreate()
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("  ACTIVE NAMENODE DETECTION — Production Grade")
+    print("=" * 60)
+
+    print(f"\n[STEP 1] Loading {HOSTS_FILE}")
+    hosts_map = load_hosts(HOSTS_FILE)
+
+    print(f"\n[STEP 2] Parsing {HDFS_SITE_PATH}")
+    config = parse_xml(HDFS_SITE_PATH)
+    print(f"  [OK] Nameservice : {config.get('dfs.nameservices')}")
+    print(f"  [OK] NameNodes   : {config.get('dfs.ha.namenodes.fincorePP')}")
+
+    print("\n[STEP 3] Extracting NameNode addresses")
+    nameservice, namenodes = get_namenodes(config)
+
+    print("\n[STEP 4] Querying JMX for Active NameNode")
+    active = find_active(namenodes, hosts_map)
+
+    if not active:
+        print("\n[FATAL] No active NameNode found!")
+        print("  Check: port 50072 reachable, /etc/hosts correct, network OK")
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print(f"  ACTIVE NAMENODE : {active['nn_id']}")
+    print(f"  HOST            : {active['host']}")
+    print(f"  IP              : {active['ip']}")
+    print(f"  PORT            : {active['port']}")
+    print("=" * 60)
+
+    print("\n[STEP 5] Building SparkSession")
+    spark = build_spark_session(nameservice, config)
+    print("  [OK] SparkSession ready!")
+
+    print("\n[STEP 6] Verifying HDFS connectivity")
+    try:
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jsc.hadoopConfiguration()
+        )
+        items = fs.listStatus(
+            spark._jvm.org.apache.hadoop.fs.Path("/")
+        )
+        print(f"  [OK] HDFS root has {len(items)} items — connection successful!")
+    except Exception as e:
+        print(f"  [WARN] HDFS listing failed: {e}")
+
+    spark.stop()
+    print("\n[DONE] Completed successfully.")
+
+
+
+
+
+
+
+
+
+
+#!/bin/bash
+set -e
+
+NAMESPACE="uat-cbops1"
+HDFS_SITE="/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml"
+CORE_SITE="/media/hadoop-3.4.2/etc/hadoop/core-site.xml"
+
+# ── Auto-detect kubeconfig ────────────────────────────────────────────────────
+KUBECONFIG_FILE=$(find /media -maxdepth 1 -name "*.conf" 2>/dev/null | head -1)
+if [ -z "$KUBECONFIG_FILE" ]; then
+    KUBECONFIG_FILE="$HOME/.kube/config"
+fi
+echo "  Using kubeconfig: $KUBECONFIG_FILE"
+[ -f "$KUBECONFIG_FILE" ] || { echo "[FAIL] kubeconfig not found"; exit 1; }
+
+echo "============================================"
+echo "  DEPLOYING ACTIVE NAMENODE DETECTION POD"
+echo "============================================"
+
+echo "[1] Checking XML files..."
+[ -f "$HDFS_SITE" ] && echo "  [OK] hdfs-site.xml" || { echo "[FAIL] $HDFS_SITE missing"; exit 1; }
+[ -f "$CORE_SITE" ] && echo "  [OK] core-site.xml" || { echo "[FAIL] $CORE_SITE missing"; exit 1; }
+
+echo "[2] Checking /etc/hosts entries..."
+for host in nn1 nn2 nn3; do
+    ip=$(grep -w "$host" /etc/hosts | awk '{print $1}' | head -1)
+    [ -n "$ip" ] && echo "  [OK] $host → $ip" || { echo "[FAIL] $host missing from /etc/hosts"; exit 1; }
+done
+
+echo "[3] Creating ConfigMap hadoop-config..."
+kubectl delete configmap hadoop-config \
+  -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE --ignore-not-found
+
+kubectl create configmap hadoop-config \
+  --from-file=hdfs-site.xml=$HDFS_SITE \
+  --from-file=core-site.xml=$CORE_SITE \
+  -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE
+echo "  [OK] ConfigMap created"
+
+echo "[4] Cleaning up old pod..."
+kubectl delete pod active \
+  -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE --ignore-not-found
+
+echo "[5] Deploying pod..."
+kubectl apply -f active.yaml \
+  -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE
+echo "  [OK] Pod created"
+
+echo "[6] Waiting for pod to start..."
+sleep 5
+
+echo "[7] Streaming logs..."
+echo "--------------------------------------------"
+kubectl logs active \
+  -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE --follow
