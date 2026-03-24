@@ -23,65 +23,98 @@ echo "[1] Checking XML files..."
 [ -f "$HDFS_SITE" ] && echo "  [OK] hdfs-site.xml" || { echo "[FAIL] missing"; exit 1; }
 [ -f "$CORE_SITE" ] && echo "  [OK] core-site.xml" || { echo "[FAIL] missing"; exit 1; }
 
-# Step 2 — Read IPs from /etc/hosts automatically
+# Step 2 — Read IPs from /etc/hosts
 echo "[2] Reading NameNode IPs from /etc/hosts..."
-NN1_IP=$(grep -w "nn1" /etc/hosts | grep -v "^#" | awk '{print $1}' | head -1)
-NN2_IP=$(grep -w "nn2" /etc/hosts | grep -v "^#" | awk '{print $1}' | head -1)
-NN3_IP=$(grep -w "nn3" /etc/hosts | grep -v "^#" | awk '{print $1}' | head -1)
+
+NN1_IP=$(awk '/^[^#]/ && /\bnn1\b/ {print $1; exit}' /etc/hosts)
+NN2_IP=$(awk '/^[^#]/ && /\bnn2\b/ {print $1; exit}' /etc/hosts)
+NN3_IP=$(awk '/^[^#]/ && /\bnn3\b/ {print $1; exit}' /etc/hosts)
 
 [ -n "$NN1_IP" ] && echo "  [OK] nn1 → $NN1_IP" || { echo "[FAIL] nn1 not in /etc/hosts"; exit 1; }
 [ -n "$NN2_IP" ] && echo "  [OK] nn2 → $NN2_IP" || { echo "[FAIL] nn2 not in /etc/hosts"; exit 1; }
 [ -n "$NN3_IP" ] && echo "  [OK] nn3 → $NN3_IP" || { echo "[FAIL] nn3 not in /etc/hosts"; exit 1; }
 
-# Step 3 — Patch active.yaml with real IPs (create a temp yaml)
-echo "[3] Injecting IPs into active.yaml..."
-sed \
-  -e "s/PLACEHOLDER_nn1/$NN1_IP/g" \
-  -e "s/PLACEHOLDER_nn2/$NN2_IP/g" \
-  -e "s/PLACEHOLDER_nn3/$NN3_IP/g" \
-  active.yaml > active_deploy.yaml
+# Step 3 — Verify IPs look valid
+echo "[3] Validating IPs..."
+for IP in "$NN1_IP" "$NN2_IP" "$NN3_IP"; do
+    if ! echo "$IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "  [FAIL] '$IP' does not look like a valid IP address"
+        exit 1
+    fi
+    echo "  [OK] $IP is valid"
+done
 
-echo "  [OK] active_deploy.yaml created with real IPs"
+# Step 4 — Generate active_deploy.yaml using Python (bulletproof replacement)
+echo "[4] Generating active_deploy.yaml with real IPs..."
 
-# Step 4 — Create hadoop ConfigMap
-echo "[4] Creating ConfigMap hadoop-config..."
+python3 - <<PYEOF
+import re
+
+with open("active.yaml", "r") as f:
+    content = f.read()
+
+content = content.replace("PLACEHOLDER_nn1", "${NN1_IP}")
+content = content.replace("PLACEHOLDER_nn2", "${NN2_IP}")
+content = content.replace("PLACEHOLDER_nn3", "${NN3_IP}")
+
+with open("active_deploy.yaml", "w") as f:
+    f.write(content)
+
+print("  [OK] active_deploy.yaml written")
+
+# Verify replacements worked
+if "PLACEHOLDER" in content:
+    print("  [FAIL] PLACEHOLDER still found in active_deploy.yaml!")
+    exit(1)
+else:
+    print("  [OK] All PLACEHOLDERs replaced successfully")
+PYEOF
+
+# Step 5 — Show what was injected (verification)
+echo "[5] Verifying injected values in active_deploy.yaml..."
+grep "NAMENODE_IP" active_deploy.yaml | while read line; do
+    echo "  $line"
+done
+
+# Step 6 — Create hadoop ConfigMap
+echo "[6] Creating ConfigMap hadoop-config..."
 kctl delete configmap hadoop-config --ignore-not-found
 kctl create configmap hadoop-config \
     --from-file=hdfs-site.xml=$HDFS_SITE \
     --from-file=core-site.xml=$CORE_SITE
 echo "  [OK] ConfigMap created"
 
-# Step 5 — Delete old pod
-echo "[5] Cleaning up old pod..."
+# Step 7 — Delete old pod
+echo "[7] Cleaning up old pod..."
 kctl delete pod active --ignore-not-found
 kctl wait pod/active --for=delete --timeout=60s 2>/dev/null || true
+echo "  [OK] Cleared"
 
-# Step 6 — Deploy
-echo "[6] Deploying pod..."
+# Step 8 — Deploy with patched yaml
+echo "[8] Deploying pod..."
 kctl apply -f active_deploy.yaml
 echo "  [OK] Pod created"
 
-# Step 7 — Wait for pod Running
-echo "[7] Waiting for pod to run..."
+# Step 9 — Wait for Running
+echo "[9] Waiting for pod..."
 for i in $(seq 1 40); do
     PHASE=$(kctl get pod active -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
-    echo "  [$i/40] $PHASE"
-    [ "$PHASE" = "Running" ]   && { echo "  [OK] Running!"; break; }
+    echo "  [$i/40] Phase: $PHASE"
+    [ "$PHASE" = "Running" ]   && { echo "  [OK] Running!";   break; }
     [ "$PHASE" = "Succeeded" ] && { echo "  [OK] Succeeded!"; break; }
     [ "$PHASE" = "Failed" ]    && {
-        echo "  [FAIL] Pod failed!"
+        echo "  [FAIL] Pod failed — describe output:"
         kctl describe pod active
         exit 1
     }
     sleep 3
 done
 
-# Step 8 — Stream logs
+# Step 10 — Stream logs
 echo ""
-echo "[8] Streaming logs:"
+echo "[10] Streaming logs:"
 echo "--------------------------------------------"
 kctl logs active -c spark-py --follow
-
 
 
 
