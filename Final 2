@@ -354,3 +354,101 @@ echo "[7] Streaming logs..."
 echo "--------------------------------------------"
 kubectl logs active \
   -n $NAMESPACE --kubeconfig $KUBECONFIG_FILE --follow
+
+
+
+
+
+
+
+
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: active
+  namespace: uat-cbops1
+spec:
+  restartPolicy: Never
+
+  # ── Fix: Override pod hostname so JVM can resolve itself ───────────────────
+  # Instead of mounting node /etc/hosts (which overwrites pod's own entry),
+  # we use initContainer to build a proper /etc/hosts with both:
+  #   - pod's own IP (so JVM getLocalHost() works)
+  #   - nn1/nn2/nn3 entries (so HDFS resolution works)
+  initContainers:
+  - name: fix-hosts
+    image: busybox
+    command:
+      - sh
+      - -c
+      - |
+        # Copy original /etc/hosts (has pod's own IP → "active" entry)
+        cp /etc/hosts /shared/hosts
+        # Append nn1/nn2/nn3 from the node's hosts file
+        grep -E "nn[1-3]" /node-hosts/hosts >> /shared/hosts
+        echo "[init] Final /etc/hosts:"
+        cat /shared/hosts
+    volumeMounts:
+      - name: shared-hosts
+        mountPath: /shared
+      - name: node-hosts
+        mountPath: /node-hosts
+
+  volumes:
+    - name: hadoop-config
+      configMap:
+        name: hadoop-config
+    - name: node-hosts           # node's /etc/hosts — has nn1/nn2/nn3
+      hostPath:
+        path: /etc/hosts
+        type: File
+    - name: shared-hosts         # writable volume shared between init + main
+      emptyDir: {}
+
+  containers:
+  - name: spark-py
+    image: h06vksharbor.corp.ad.sbi/cbops/etl:v100
+    imagePullPolicy: Always
+    resources:
+      requests:
+        memory: "10Gi"
+        cpu: "8"
+      limits:
+        memory: "12Gi"
+        cpu: "10"
+
+    env:
+      - name: MY_POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+
+    command: ["/opt/spark/bin/spark-submit"]
+    args:
+      - "--master"
+      - "local[*]"
+      - "--name"
+      - "ActiveNameNodeDetection"
+      - "--driver-memory"
+      - "10g"
+      - "--executor-memory"
+      - "10g"
+      - "--conf"
+      - "spark.driver.maxResultSize=4g"
+      - "--conf"
+      - "spark.driver.host=$(MY_POD_IP)"
+      - "--conf"
+      - "spark.driver.bindAddress=0.0.0.0"
+      - "--jars"
+      - "/app/Scripts/jars/ojdbc8.jar"
+      - "/app/Scripts/active_hdfs.py"
+
+    volumeMounts:
+      - name: hadoop-config
+        mountPath: /media/hadoop-3.4.2/etc/hadoop
+        readOnly: true
+      - name: shared-hosts       # ← merged hosts file (pod IP + nn1/nn2/nn3)
+        mountPath: /etc/hosts
+        subPath: hosts           # ← mount only the file, not the whole dir
+
