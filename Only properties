@@ -1,0 +1,115 @@
+"""
+print_nameservice.py
+====================
+Reads hdfs-site.xml and prints:
+  - Nameservice name
+  - All NameNode IDs with their IP/hostname
+No Hadoop installation needed — pure Python only.
+"""
+
+import xml.etree.ElementTree as ET
+import sys
+
+HDFS_SITE = "/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml"
+
+
+def parse_xml(path):
+    try:
+        tree = ET.parse(path)
+        return {
+            p.find("name").text.strip(): p.find("value").text.strip()
+            for p in tree.getroot().findall("property")
+        }
+    except FileNotFoundError:
+        print(f"[FATAL] File not found: {path}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[FATAL] Parse error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+
+    config = parse_xml(HDFS_SITE)
+
+    # ── Nameservice ───────────────────────────────────────────────────────────
+    nameservice = config.get("dfs.nameservices", "").strip()
+    if not nameservice:
+        print("[FATAL] dfs.nameservices not found in hdfs-site.xml")
+        sys.exit(1)
+
+    # ── NameNode IDs ──────────────────────────────────────────────────────────
+    nn_ids_raw = config.get(f"dfs.ha.namenodes.{nameservice}", "")
+    if not nn_ids_raw:
+        print(f"[FATAL] dfs.ha.namenodes.{nameservice} not found")
+        sys.exit(1)
+
+    nn_ids = [x.strip() for x in nn_ids_raw.split(",")]
+
+    # ── Print Results ─────────────────────────────────────────────────────────
+    print("=" * 50)
+    print(f"  NAMESERVICE : {nameservice}")
+    print("=" * 50)
+    for nn_id in nn_ids:
+        http_key = f"dfs.namenode.http-address.{nameservice}.{nn_id}"
+        rpc_key  = f"dfs.namenode.rpc-address.{nameservice}.{nn_id}"
+
+        http_addr = config.get(http_key, "NOT FOUND")
+        rpc_addr  = config.get(rpc_key,  "NOT FOUND")
+
+        # Extract just the IP/hostname (strip port)
+        http_ip = http_addr.split(":")[0] if ":" in http_addr else http_addr
+        rpc_ip  = rpc_addr.split(":")[0]  if ":" in rpc_addr  else rpc_addr
+
+        print(f"\n  NameNode ID  : {nn_id}")
+        print(f"  HTTP address : {http_ip}  (port {http_addr.split(':')[1] if ':' in http_addr else 'N/A'})")
+        print(f"  RPC  address : {rpc_ip}   (port {rpc_addr.split(':')[1]  if ':' in rpc_addr  else 'N/A'})")
+
+    print("\n" + "=" * 50)
+    print(f"  TOTAL NAMENODES : {len(nn_ids)}")
+    print("=" * 50)
+
+
+
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: print-nameservice
+  namespace: uat-cbops1
+spec:
+  restartPolicy: Never
+
+  volumes:
+    - name: hadoop-config
+      configMap:
+        name: hadoop-config     # already exists from before
+
+  containers:
+  - name: spark-py
+    image: h06vksharbor.corp.ad.sbi/cbops/etl:v100
+    imagePullPolicy: Always
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "1"
+      limits:
+        memory: "2Gi"
+        cpu: "2"
+    env:
+      - name: MY_POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+    command: ["python3"]        # plain python3 — no spark-submit needed
+    args:
+      - "/app/Scripts/print_nameservice.py"
+    volumeMounts:
+      - name: hadoop-config
+        mountPath: /media/hadoop-3.4.2/etc/hadoop
+        readOnly: true
+
+
+
+
+
