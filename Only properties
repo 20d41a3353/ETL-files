@@ -113,3 +113,22 @@ spec:
 
 
 
+
+
+
+# Add script to the existing hadoop-config ConfigMap
+kubectl create configmap hadoop-config \
+  --from-file=hdfs-site.xml=/media/hadoop-3.4.2/etc/hadoop/hdfs-site.xml \
+  --from-file=core-site.xml=/media/hadoop-3.4.2/etc/hadoop/core-site.xml \
+  --from-file=print_nameservice.py=/media/print_nameservice.py \
+  -n uat-cbops1 \
+  --kubeconfig /media/h06vksuatlcbopscls.conf
+
+# Update yaml to run from /media/hadoop-3.4.2/etc/hadoop/
+# (that's where ConfigMap is mounted)
+
+
+
+
+
+
