@@ -1,0 +1,38 @@
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+def get_active_nn(nn_list):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    gateway = spark.sparkContext._gateway
+    
+    for address in nn_list:
+        try:
+            uri = f"hdfs://{address}"
+            
+            fs = gateway.jvm.org.apache.hadoop.fs.FileSystem.get(
+                gateway.jvm.java.net.URI(uri),
+                conf
+            )
+
+            # 🔥 Lightweight call
+            fs.exists(gateway.jvm.org.apache.hadoop.fs.Path("/"))
+
+            return address   # ✅ ACTIVE NN found
+
+        except Exception:
+            continue
+
+    raise Exception("No Active NameNode found")
+
+
+# 🔥 Your hardcoded NN IPs
+nn_list = [
+    "10.177.179.158:8022",
+    "10.177.179.159:8022",
+    "10.177.179.160:8022"
+]
+
+active_nn = get_active_nn(nn_list)
+
+print("✅ Active NameNode:", active_nn)
