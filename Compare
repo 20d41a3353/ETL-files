@@ -1,0 +1,235 @@
+
+
+option 1
+
+from pyspark.sql import SparkSession
+import requests
+spark = SparkSession.builder.getOrCreate()
+
+
+def get_hdfs_properties(environment):
+
+    hdfs_properties = {
+        "dev": {
+            "nameservice": "fincoredev",
+            "nodes": "10.177.103.199,10.177.103.192,10.177.103.196",
+        },
+        "sit": {
+            "nameservice": "fincorest",
+            "nodes": "10.177.179.59 ,10.177.179.60,10.177.179.61",
+        },
+        "uat": {
+            "nameservice": "fincoreuat",
+            "nodes": "10.177.179.99 ,10.177.179.100,10.177.179.101",
+        },
+        "preprod": {
+            "nameservice": "fincorePP",
+            "nodes": "10.177.179.158,10.177.179.159,10.177.179.160",
+        },
+        "prod": {
+            "nameservice": "fincore",
+            "nodes": "10.177.224.102,10.177.224.103,10.177.224.104,10.177.224.105,10.177.224.106",
+        },
+    }
+    return (
+        hdfs_properties[environment]["nameservice"],
+        hdfs_properties[environment]["nodes"],
+    )
+
+
+def get_active_namenode_JMX():
+   properties = get_hdfs_properties("preprod")
+   print("properties",properties)
+
+   properties = list(properties)
+   namenodes = properties[1].split(",")
+
+   print("Namenodes========= > ",namenodes)
+#    namenodes = ["host1:9870","10.177.103.199:50072", "10.0.17.76:9870"]
+   port = "50072"
+   for nn in namenodes:
+       print("Checking name node - ",nn)
+       try:
+           url = f"http://{nn}:{port}/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus"
+           res = requests.get(url, timeout=3).json()
+           state = res['beans'][0]['State']
+           port =res['beans'][0]['HostAndPort']
+           if state == "active":
+               host = nn.split(":")[0]
+               print(host)               
+               rpc_port = port.split(":")[1]
+               print(rpc_port)
+               return f"{host}:{rpc_port}"
+       except Exception as e:
+           print(f"Failed for {nn}: {e}")
+   return None
+
+
+def get_active_nn_RPC(nn_list):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    gateway = spark.sparkContext._gateway
+    
+    for address in nn_list:
+        try:
+            uri = f"hdfs://{address}:8022"
+            
+            fs = gateway.jvm.org.apache.hadoop.fs.FileSystem.get(
+                gateway.jvm.java.net.URI(uri),
+                conf
+            )
+           
+            fs.exists(gateway.jvm.org.apache.hadoop.fs.Path("/"))
+
+            return address  
+
+        except Exception:
+            continue
+
+    raise Exception("No Active NameNode found")
+
+
+if __name__ == "__main__":
+    try:
+        properties = get_hdfs_properties("preprod")
+        print("properties",properties)
+        properties = list(properties)
+        namenodes = properties[1].split(",")
+
+        active_nn = get_active_nn_RPC(namenodes)
+        HDFS_BASE = f"hdfs://{active_nn}:8022"
+
+        print("get_active_nn_RPC Active NameNode:", HDFS_BASE)
+
+        # active_nn = get_active_namenode_JMX()
+        # HDFS_BASE = f"hdfs://{active_nn}"
+        # print("get_active_namenode_JMX Active NameNode:", HDFS_BASE)
+    except Exception as e:
+        active_nn = get_active_namenode_JMX()
+        HDFS_BASE = "hdfs://{active_nn}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+option 2
+
+import os
+
+from pyspark.sql import SparkSession
+
+from common.properties import get_oracle_properties
+
+
+def get_hdfs_properties(environment):
+
+    hdfs_properties = {
+        "dev": {
+            "nameservice": "fincoredev",
+            "nodes": "10.177.103.199,10.177.103.192,10.177.103.196",
+        },
+        "sit": {
+            "nameservice": "fincorest",
+            "nodes": "10.177.179.59 ,10.177.179.60,10.177.179.61",
+        },
+        "uat": {
+            "nameservice": "fincoreuat",
+            "nodes": "10.177.179.99 ,10.177.179.100,10.177.179.101",
+        },
+        "preprod": {
+            "nameservice": "fincorePP",
+            "nodes": "10.177.179.158,10.177.179.159,10.177.179.160",
+        },
+        "prod": {
+            "nameservice": "fincore",
+            "nodes": "10.177.224.102,10.177.224.103,10.177.224.104,10.177.224.105,10.177.224.106",
+        },
+    }
+    return (
+        hdfs_properties[environment]["namespace"],
+        hdfs_properties[environment]["nodes"],
+    )
+
+
+def get_environment_by_oracle():
+    oracle_properties = get_oracle_properties()
+    oracle_url = oracle_properties["url"]
+
+    oracle_config = {
+        "dev": "10.177.103.192",
+        "sit": "10.177.179.46",
+        "uat": "10.177.179.85",
+        "preprod": "10.177.179.145",
+        "prod": "10.190.224.79,10.190.224.80",
+        "dr": "10.177.196.126,10.177.196.127",
+    }
+
+    if (oracle_properties is None) or (oracle_url is None):
+        return "dev"
+
+    for env, ips in oracle_config.items():
+        ip_list = [ip.strip() for ip in ips.split(",")]
+        for ip in ip_list:
+            if ip in oracle_url:
+                return env
+    return "dev"
+    
+    
+    
+    
+    
+    
+
+def setup_dynamic_hdfs(spark):
+
+    environment = os.getenv("fincore_environment")
+    if environment is None:
+        environment = get_environment_by_oracle()
+    ns, nodes_str = get_hdfs_properties(environment)
+
+    port = "8022"
+    node_list = [n.strip() for n in nodes_str.split(",") if n.strip()]
+    if not node_list:
+        print("Error: No valid nodes found")
+        return None
+    sc = spark.sparkContext
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+
+    nn_ids = [f"nn{i+1}" for i in range(len(node_list))]
+
+    hadoop_conf.set("dfs.nameservices", ns)
+    hadoop_conf.set(f"dfs.ha.namenodes.{ns}", ",".join(nn_ids))
+
+    for nn_id, addr in zip(nn_ids, node_list):
+        full_addr = f"{addr}:{port}"
+        print(f"Setting {nn_id} to {full_addr}")
+        hadoop_conf.set(f"dfs.namenode.rpc-address.{ns}.{nn_id}", full_addr)
+
+    hadoop_conf.set(
+        f"dfs.client.failover.proxy.provider.{ns}",
+        "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider",
+    )
+
+    return ns
+
+
+
+
+def read_parquet(spark, nameservice):
+    df = spark.read.parquet(f"hdfs://{nameservice}/druid-test/gbortogl_file.parquet")
+    df.show()
+
+
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("HDFS_HA").getOrCreate()
+
+    nameservice = setup_dynamic_hdfs(spark)
+    read_parquet(spark, nameservice)
+ 
