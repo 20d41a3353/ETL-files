@@ -223,3 +223,96 @@ def get_kafka_ip():
 # dsfd = get_kafka_ip()
 # print(dsfd)
 
+
+
+
+
+
+/////////////////////////////
+
+
+
+
+
+from pyspark.sql import SparkSession
+from delta import configure_spark_with_delta_pip
+import os
+
+# ---------------------------
+# Spark Setup
+# ---------------------------
+builder = SparkSession.builder \
+    .appName("DeltaLakeOperation") \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+
+spark = configure_spark_with_delta_pip(builder).getOrCreate()
+
+# ---------------------------
+# ENV CONFIG
+# ---------------------------
+environment = "dev"
+
+def get_hdfs_properties(environment):
+    return {
+        "dev": ["10.177.103.199", "10.177.103.192", "10.177.103.196"],
+        "sit": ["10.177.179.59", "10.177.179.60", "10.177.179.61"],
+        "uat": ["10.177.179.99", "10.177.179.100", "10.177.179.101"],
+        "preprod": ["10.177.179.158", "10.177.179.159", "10.177.179.160"],
+        "prod": ["10.177.224.102", "10.177.224.103", "10.177.224.104"]
+    }.get(environment, [])
+
+
+# ---------------------------
+# 🔥 ACTIVE NN RESOLVER (FINAL)
+# ---------------------------
+def get_active_nn(nn_list, port="8022", timeout=3):
+    sc = spark.sparkContext
+    conf = sc._jsc.hadoopConfiguration()
+    gateway = sc._gateway
+
+    for ip in nn_list:
+        address = f"{ip}:{port}"
+        try:
+            print(f"Trying NN → {address}")
+
+            uri = gateway.jvm.java.net.URI(f"hdfs://{address}")
+            fs = gateway.jvm.org.apache.hadoop.fs.FileSystem.get(uri, conf)
+
+            # lightweight call
+            fs.exists(gateway.jvm.org.apache.hadoop.fs.Path("/"))
+
+            print(f"✅ Active NameNode Found → {address}")
+            return f"hdfs://{address}"
+
+        except Exception as e:
+            print(f"❌ Failed → {address} | {str(e)[:80]}")
+            continue
+
+    raise Exception("🚨 No Active NameNode found")
+
+
+# ---------------------------
+# MAIN FUNCTION
+# ---------------------------
+def get_hdfs_base():
+    nodes = get_hdfs_properties(environment)
+
+    if not nodes:
+        raise Exception("No HDFS nodes configured")
+
+    return get_active_nn(nodes)
+
+
+# ---------------------------
+# USAGE
+# ---------------------------
+try:
+    HDFS_BASE = get_hdfs_base()
+    print("🔥 HDFS BASE →", HDFS_BASE)
+
+    # Example read
+    # df = spark.read.parquet(f"{HDFS_BASE}/path")
+
+except Exception as e:
+    print("🚨 ERROR:", str(e))
