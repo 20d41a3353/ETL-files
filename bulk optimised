@@ -1,0 +1,224 @@
+from textwrap import dedent
+
+code = dedent("""
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col,
+    trim,
+    substring,
+    regexp_replace,
+    when
+)
+from pyspark.storagelevel import StorageLevel
+from functools import reduce
+import gc
+
+# =========================================================
+# SPARK CONFIGURATION (Production Grade)
+# =========================================================
+
+spark = (
+    SparkSession.builder
+    .appName("BULK_FIXED_WIDTH_ETL")
+    .config("spark.sql.shuffle.partitions", "200")
+    .config("spark.default.parallelism", "200")
+    .config("spark.sql.files.maxPartitionBytes", "134217728")  # 128MB
+    .config("spark.driver.memory", "4g")
+    .config("spark.executor.memory", "8g")
+    .config("spark.executor.memoryOverhead", "2g")
+    .config("spark.sql.adaptive.enabled", "true")
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("WARN")
+
+# =========================================================
+# INPUTS
+# =========================================================
+
+BASE_HDFS = "/apps/hdfs"
+
+# =========================================================
+# READ CONTROL TABLE FROM ORACLE
+# =========================================================
+
+control_df = (
+    spark.read.format("jdbc")
+    .option("url", "jdbc:oracle:thin:@host:1521/service")
+    .option("dbtable", "controll_file_master")
+    .option("user", "username")
+    .option("password", "password")
+    .option("driver", "oracle.jdbc.driver.OracleDriver")
+    .load()
+)
+
+# =========================================================
+# GROUP FILES WITHOUT COLLECTING HUGE DATA TO DRIVER
+# =========================================================
+
+control_rows = (
+    control_df
+    .select("STREAM", "FILE_NAME")
+    .distinct()
+    .collect()
+)
+
+all_paths = []
+
+for row in control_rows:
+    stream = row["STREAM"]
+    file_name = row["FILE_NAME"]
+
+    path = f"{BASE_HDFS}/CBS-FILES/12-03-2026/GLIF/{stream}/{file_name}.gz"
+
+    all_paths.append(path)
+
+# =========================================================
+# READ RAW FILES
+# =========================================================
+
+raw_df = (
+    spark.read
+    .format("text")
+    .load(all_paths)
+    .repartition(200)
+)
+
+# Persist only if reused multiple times
+raw_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+# =========================================================
+# READ METADATA TABLE
+# =========================================================
+
+parameters_df = (
+    spark.read.format("jdbc")
+    .option("url", "jdbc:oracle:thin:@host:1521/service")
+    .option("dbtable", "TOTAL_DATA_PARAMETERS")
+    .option("user", "username")
+    .option("password", "password")
+    .option("driver", "oracle.jdbc.driver.OracleDriver")
+    .load()
+    .filter(col("TOBEINCLUDED") == "yes")
+    .select(
+        "COLUMNNAME",
+        "STARTVALUE",
+        "ENDVALUE",
+        "DATATYPE"
+    )
+)
+
+# IMPORTANT:
+# Metadata is usually small.
+# Only collect metadata, not actual data.
+metadata = parameters_df.collect()
+
+# =========================================================
+# BUILD ALL COLUMNS IN SINGLE SELECT
+# (Avoid multiple withColumn transformations)
+# =========================================================
+
+select_exprs = [col("value")]
+
+for row in metadata:
+
+    column_name = row["COLUMNNAME"]
+
+    start_pos = int(row["STARTVALUE"])
+
+    end_pos = int(row["ENDVALUE"]) - 1
+
+    length = end_pos - start_pos + 1
+
+    expr = trim(
+        substring(
+            col("value"),
+            start_pos,
+            length
+        )
+    ).alias(column_name)
+
+    select_exprs.append(expr)
+
+transformed_df = raw_df.select(*select_exprs)
+
+# =========================================================
+# SIGNED AMOUNT CLEANING
+# =========================================================
+
+signed_mapping = {
+    "p": "0",
+    "q": "1",
+    "r": "2",
+    "s": "3",
+    "t": "4",
+    "u": "5",
+    "v": "6",
+    "w": "7",
+    "x": "8",
+    "y": "9"
+}
+
+amount_columns = [
+    row["COLUMNNAME"]
+    for row in metadata
+    if row["DATATYPE"] == "AMOUNT"
+]
+
+for amt_col in amount_columns:
+
+    last_char = substring(col(amt_col), -1, 1)
+
+    updated_col = col(amt_col)
+
+    for k, v in signed_mapping.items():
+
+        updated_col = when(
+            last_char == k,
+            regexp_replace(col(amt_col), k + "$", v)
+        ).otherwise(updated_col)
+
+    transformed_df = transformed_df.withColumn(
+        amt_col,
+        updated_col
+    )
+
+# =========================================================
+# DROP RAW COLUMN
+# =========================================================
+
+transformed_df = transformed_df.drop("value")
+
+# =========================================================
+# WRITE TO DELTA
+# =========================================================
+
+(
+    transformed_df.write
+    .format("delta")
+    .mode("append")
+    .option("mergeSchema", "true")
+    .save("/datalake/glif/output")
+)
+
+# =========================================================
+# CLEANUP
+# =========================================================
+
+raw_df.unpersist()
+
+gc.collect()
+
+spark.catalog.clearCache()
+
+print("ETL COMPLETED SUCCESSFULLY")
+""")
+
+path = "/mnt/data/production_grade_etl.py"
+
+with open(path, "w") as f:
+    f.write(code)
+
+print(f"Created optimized ETL script at: {path}")
