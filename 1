@@ -18,6 +18,262 @@ from pyspark.sql.functions import ltrim, col
 from common.create_path_if_not_exists import create_path_if_not_exists
 
 import re   
+from common.logger import setup_logger 
+from common.properties import get_oracle_properties
+from common.dateUtil import get_etl_date
+from common.fileUtil import files_to_read
+from common.fileUtil import paths_for_read
+from common.fileUtil import tables_to_read
+from common.processRun import get_run_id
+from common.pattern import read_patterns
+from common.createSpark import create_spark_session
+from common.fileUtil import get_hdfs_base
+from common.check_monthend import check_MonthEnd
+from common.check_monthend import check_MonthEnd_minus1
+from common.check_monthend import check_Previous_MonthEnd
+from common.batch_journal_id import get_batch_id
+from common.batch_journal_id import get_journal_id
+from common.constants import Process
+from common.Precheck import run_currency_precheck
+from datetime import datetime,date
+from common.PPF_FCNB import ppf_postings
+from common.PPF_FCNB import monthend_posting
+from common.read_write_oracle import read_oracle
+from common.read_write_oracle import write_oracle
+from common.provision1 import process_provision_data
+from common.provision1 import reverse_provision
+from common.fileUtil import get_delta_path_by_file_type
+from common.processRun import get_process_run_id
+from pyspark.sql.functions import col, trim, substring,regexp_replace
+from collections import defaultdict
+
+
+def build_digit_map():
+    """Build the sign-character to digit mapping."""
+    return create_map(
+        lit('1'), lit('1'), lit('2'), lit('2'), lit('3'), lit('3'), lit('4'), lit('4'), lit('5'), lit('5'),
+        lit('6'), lit('6'), lit('7'), lit('7'), lit('8'), lit('8'), lit('9'), lit('9'), lit('0'), lit('0'),
+        lit('p'), lit('0'), lit('q'), lit('1'), lit('r'), lit('2'), lit('s'), lit('3'), lit('t'), lit('4'),
+        lit('u'), lit('5'), lit('v'), lit('6'), lit('w'), lit('7'), lit('x'), lit('8'), lit('y'), lit('9')
+    )
+
+
+def apply_transformations(df_raw, metadata):
+    """
+    Apply fixed-width column extraction and amount decoding
+    to a raw text DataFrame using the given metadata rows.
+    Returns (transformed_df, columns_list).
+    """
+    transformed_df = df_raw
+    columns = []
+
+    for row in metadata:
+        if row["TOBEINCLUDED"] == "yes":
+            column_name = row["COLUMNNAME"]
+            columns.append(column_name)
+            start_pos = int(row["STARTVALUE"])
+            end_pos   = int(row["ENDVALUE"]) - 1
+            col_len   = end_pos - start_pos + 1
+            transformed_df = transformed_df.withColumn(
+                column_name,
+                trim(substring(col("value"), start_pos, col_len))
+            )
+
+    transformed_df = transformed_df.drop("value")
+
+    # Date / time conversions
+    transformed_df = (
+        transformed_df
+        .withColumn("POST_DATE",  expr("date_add(to_date('1899-12-31'), cast(POST_DATE  as int))"))
+        .withColumn("TRANS_DATE", expr("date_add(to_date('1899-12-31'), cast(TRANS_DATE as int))"))
+        .withColumn("POST_TIME",
+            concat(
+                col("POST_DATE"), lit(" - "),
+                expr("""
+                    concat(
+                        lpad(cast(floor(POST_TIME / 3600000)            as string), 2, '0'), ':',
+                        lpad(cast(floor((POST_TIME % 3600000) / 60000)  as string), 2, '0'), ':',
+                        lpad(cast(floor((POST_TIME % 60000)  / 1000)    as string), 2, '0')
+                    )
+                """)
+            )
+        )
+        .withColumn("ACCOUNT", regexp_replace(col("ACCOUNT"), r"^0+", ""))
+    )
+
+    # Amount decoding
+    df_processed = transformed_df.withColumns({
+        "Id":            concat(col("BRANCH_CODE"), col("CURRENCY"), col("CGL")),
+        "currency_code": col("FCY_CODE")
+    })
+
+    df_clean = df_processed.withColumn(
+        "Amount_raw",
+        when(col("currency_code") != "INR", col("FCY_AMT")).otherwise(col("LCY_AMT"))
+    )
+
+    df_clean = df_clean.withColumns({
+        "Amount_base": substring(col("Amount_raw"), 1, 16),
+        "sign_char":   substring(col("Amount_raw"), 17, 1)
+    })
+
+    digit_map = build_digit_map()
+
+    df_with_signed = df_clean.withColumns({
+        "last_digit": digit_map.getItem(col("sign_char")),
+        "sign":       when(col("sign_char").isin(['p','q','r','s','t','u','v','w','x','y']), -1).otherwise(1)
+    })
+
+    df_with_signed = df_with_signed.withColumn(
+        "Amount_decimal_str",
+        concat(col("Amount_base"), col("last_digit"))
+    )
+
+    df_final = df_with_signed.withColumn(
+        "AMOUNT",
+        (col("Amount_decimal_str").cast(DecimalType(25, 4)) / 1000) * col("sign")
+    )
+
+    return df_final.select(*columns, "AMOUNT"), columns
+
+
+def process_stream(stream, paths, spark, metadata):
+    """
+    Reads and transforms one stream folder (a / b / c …).
+    Returns a fully transformed DataFrame for that stream.
+    Called concurrently from multiple threads.
+    """
+    print(f"[stream={stream}] Reading {len(paths)} file(s): {paths}")
+    df_raw = spark.read.format("text").load(paths)
+    df_final, _ = apply_transformations(df_raw, metadata)
+    print(f"[stream={stream}] Done transforming.")
+    return df_final
+
+
+def main():
+    print("hello")
+
+    BASE_HDFS = get_hdfs_base()
+    date_str  = "12-03-2026"
+    date_obj  = datetime.strptime(date_str, "%d-%m-%Y")
+    output_date = date_obj.strftime("%d-%b-%y").upper()
+    print(output_date)
+
+    spark = create_spark_session("Bulk Data PIPELINE", BASE_HDFS)
+
+    # ── 1. Fetch file names from Oracle ──────────────────────────────────────
+    query = f"""(select FILE_NAME from controll_file_master
+                  where ETL_DATE = '{output_date}' and FILE_TYPE = 'GLIF') e"""
+    filenames = read_oracle(spark, query)
+    my_list   = [row['FILE_NAME'] for row in filenames.select('FILE_NAME').collect()]
+
+    # ── 2. Fetch metadata (done once, shared across threads) ──────────────────
+    query_parm = "(select * from TOTAL_DATA_PARAMETERS where FILE_TYPE = 'GLIF') e"
+    parameters = read_oracle(spark, query_parm)
+    metadata   = parameters.collect()          # plain Python list – safe to share
+
+    # ── 3. Group files by stream letter ──────────────────────────────────────
+    pattern = r'^(.*?)(\d{8})_([a-zA-Z])_.*$'
+    grouped = defaultdict(list)
+
+    for fname in my_list:
+        match = re.match(pattern, fname)
+        if match:
+            stream = match.group(3).lower()
+            grouped[stream].append(fname)
+
+    # Build full HDFS paths per stream
+    stream_paths = {
+        stream: [f"{BASE_HDFS}/CBS-FILES/{date_str}/GLIF/{stream}/{ft}.gz" for ft in files]
+        for stream, files in grouped.items()
+    }
+    print(f"Streams to process: {list(stream_paths.keys())}")
+
+    # ── 4. Process each stream concurrently ──────────────────────────────────
+    # ThreadPoolExecutor is the right choice here:
+    #   • Spark's JVM operations release the GIL, so threads run truly in parallel.
+    #   • Each thread submits independent Spark jobs that the cluster executes
+    #     simultaneously, giving you real multi-job parallelism.
+    stream_dfs = {}
+    max_workers = builtins.min(len(stream_paths), 8)   # cap at 8 concurrent Spark jobs
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_stream = {
+            executor.submit(process_stream, stream, paths, spark, metadata): stream
+            for stream, paths in stream_paths.items()
+        }
+
+        for future in concurrent.futures.as_completed(future_to_stream):
+            stream = future_to_stream[future]
+            try:
+                stream_dfs[stream] = future.result()
+                print(f"[stream={stream}] Collected successfully.")
+            except Exception as exc:
+                print(f"[stream={stream}] FAILED with error: {exc}")
+                raise   # re-raise so the job fails fast on any stream error
+
+    # ── 5. Union all stream DataFrames ───────────────────────────────────────
+    print(f"Unioning {len(stream_dfs)} stream DataFrames …")
+    df_all = None
+    for stream, df in stream_dfs.items():
+        df_all = df if df_all is None else df_all.unionByName(df)
+
+    df_all.show(20, False)
+
+    # ── 6. Write to Delta ─────────────────────────────────────────────────────
+    path = f"hdfs://10.177.103.199/data-lake/{date_str}/GLIF/"
+    res  = create_path_if_not_exists(spark, path)
+    print(res)
+
+    df_all.coalesce(10).write.format("delta").mode("overwrite").save(path)
+    print("Write complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import datetime 
+from pyspark.sql import SparkSession , functions as F
+import pyspark.sql.types as T
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
+from pyspark.sql.functions import  to_date,expr, round, lower, col,when, length, trim,count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first, input_file_name
+from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType, DateType, TimestampType
+from datetime import date, timedelta
+from pyspark.sql.functions import desc
+import sys
+from py4j.java_gateway import java_import
+from delta.tables import DeltaTable 
+import concurrent.futures
+import builtins
+from pyspark.sql import Row
+from pyspark.sql.functions import expr, lpad, floor, concat_ws
+from pyspark.sql.functions import ltrim, col
+from common.create_path_if_not_exists import create_path_if_not_exists
+
+import re   
 # =========== Common Methods =============================
 from common.logger import setup_logger 
 from common.properties import get_oracle_properties
