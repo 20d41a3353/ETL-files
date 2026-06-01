@@ -1,0 +1,351 @@
+import re
+import concurrent.futures
+from collections import defaultdict
+from datetime import datetime
+
+from pyspark.sql import functions as F
+from pyspark.sql.functions import (
+    col,
+    trim,
+    substring,
+    regexp_replace,
+    lit
+)
+
+from common.createSpark import create_spark_session
+from common.fileUtil import get_hdfs_base
+from common.read_write_oracle import read_oracle
+from common.create_path_if_not_exists import create_path_if_not_exists
+
+
+BASE_HDFS = get_hdfs_base()
+
+DATE_STR = "11-05-2026"
+
+DATE_OBJ = datetime.strptime(DATE_STR, "%d-%m-%Y")
+
+OUTPUT_DATE = DATE_OBJ.strftime("%d-%b-%y").upper()
+
+
+def get_file_list(spark, file_type, input_path):
+
+    query = f"""
+    (
+        select FILE_NAME
+        from controll_file_master
+        where ETL_DATE = '{OUTPUT_DATE}'
+        and FILE_TYPE ='CBS'
+        and FILE_NAME like '{file_type}%'
+    ) e
+    """
+
+    filenames = read_oracle(spark, query)
+
+    file_list = [
+        row.FILE_NAME
+        for row in filenames.select("FILE_NAME").collect()
+    ]
+
+    pattern = r'^(.*?)(\d{8})_([a-zA-Z])_.*$'
+
+    grouped = defaultdict(list)
+
+    for fname in file_list:
+        match = re.match(pattern, fname)
+
+        if match:
+            stream = match.group(3).lower()
+            grouped[stream].append(fname)
+
+    all_paths = []
+
+    for stream, files in grouped.items():
+        all_paths.extend(
+            [f"{input_path}/{stream}/{f}.gz" for f in files]
+        )
+
+    return all_paths
+
+
+def build_fixed_width_df(df_raw, metadata):
+
+    select_exprs = []
+
+    for row in metadata:
+
+        if str(row["TOBEINCLUDED"]).lower() != "yes":
+            continue
+
+        start_pos = int(row["STARTVALUE"])
+
+        end_pos = int(row["ENDVALUE"]) - 1
+
+        field_len = end_pos - start_pos + 1
+
+        select_exprs.append(
+            trim(
+                substring(
+                    col("value"),
+                    start_pos,
+                    field_len
+                )
+            ).alias(row["COLUMNNAME"])
+        )
+
+    return df_raw.select(*select_exprs)
+
+
+def convert_signed_columns(df, columns):
+
+    for c in columns:
+
+        df = df.withColumn(
+            c,
+            F.when(col(c).isNull(), None)
+            .when(
+                F.substring(col(c), -1, 1) == "-",
+                (
+                    F.regexp_replace(
+                        col(c),
+                        "[-+]$",
+                        ""
+                    ).cast("decimal(25,4)")
+                    * -1
+                )
+            )
+            .otherwise(
+                F.regexp_replace(
+                    col(c),
+                    "[-+]$",
+                    ""
+                ).cast("decimal(25,4)")
+            )
+        )
+
+    return df
+
+
+def process(spark, file_type):
+
+    try:
+
+        print(f"Started {file_type}")
+
+        input_path = (
+            f"{BASE_HDFS}/CBS-FILES/{DATE_STR}/BANCS"
+        )
+
+        output_path = (
+            f"{BASE_HDFS}/data-lake/{DATE_STR}/{file_type}/"
+        )
+
+        all_paths = get_file_list(
+            spark,
+            file_type,
+            input_path
+        )
+
+        if not all_paths:
+            print(f"No files found for {file_type}")
+            return
+
+        df_raw = (
+            spark.read
+            .format("text")
+            .load(all_paths)
+        )
+
+        query_parm = f"""
+        (
+            select *
+            from TOTAL_DATA_PARAMETERS
+            where FILE_TYPE = '{file_type}'
+        ) e
+        """
+
+        parameters = read_oracle(
+            spark,
+            query_parm
+        )
+
+        metadata = parameters.collect()
+
+        transformed_df = build_fixed_width_df(
+            df_raw,
+            metadata
+        )
+
+        signed_cols = []
+
+        if file_type == "INV":
+
+            signed_cols = [
+                "BALANCE",
+                "INT_AVAILABLE",
+                "INT_ADJUSTMENT",
+                "OD_DR_INT_AVAIL",
+                "DR_INT_ADJUSTMENT",
+                "OD_PENALTY_INT_ACCR",
+                "OD_PENALTY_INT_ADJ",
+                "OD_DR_INT_INCR",
+                "INT_INCR"
+            ]
+
+        elif file_type == "BOR":
+
+            signed_cols = [
+                "BALALANCE",
+                "LOAN_TERM",
+                "APP_AMT",
+                "ADV_VAL",
+                "COLLECTION_AMT",
+                "INT_ACCR",
+                "BPI_ACCR",
+                "CI_ACCR",
+                "INT_ADJUSTMENT",
+                "ARR_INT_ACCR",
+                "ARR_INT_ADJUSTMENT"
+            ]
+
+        elif file_type in (
+            "GLCCCTA",
+            "GLCCGEN",
+            "GLCCINV"
+        ):
+
+            signed_cols = ["AMOUNT"]
+
+        transformed_df = convert_signed_columns(
+            transformed_df,
+            signed_cols
+        )
+
+        if "ACCOUNT" in transformed_df.columns:
+
+            transformed_df = transformed_df.withColumn(
+                "ACCOUNT",
+                regexp_replace(
+                    col("ACCOUNT"),
+                    r"^0+",
+                    ""
+                )
+            )
+
+        if file_type in (
+            "GLCCCTA",
+            "GLCCGEN"
+        ):
+
+            transformed_df = transformed_df.withColumn(
+                "ACCOUNT",
+                lit("NA")
+            )
+
+        if file_type not in (
+            "GLCCCTA",
+            "GLCCGEN",
+            "GLCCINV"
+        ):
+
+            for c in [
+                "CGL_COMP_1_DR",
+                "CGL_COMP_1_CR"
+            ]:
+
+                if c in transformed_df.columns:
+
+                    transformed_df = transformed_df.withColumn(
+                        c,
+                        F.substring(
+                            col(c),
+                            -4,
+                            4
+                        )
+                    )
+
+            for c in [
+                "CGL_COMP_2_DR",
+                "CGL_COMP_2_CR"
+            ]:
+
+                if c in transformed_df.columns:
+
+                    transformed_df = transformed_df.withColumn(
+                        c,
+                        F.substring(
+                            col(c),
+                            -2,
+                            2
+                        )
+                    )
+
+        create_path_if_not_exists(
+            spark,
+            output_path
+        )
+
+        (
+            transformed_df.write
+            .format("delta")
+            .mode("overwrite")
+            .save(output_path)
+        )
+
+        print(f"Completed {file_type}")
+
+    except Exception as e:
+
+        print(
+            f"Failed {file_type}: {str(e)}"
+        )
+        raise
+
+
+def main():
+
+    spark = (
+        create_spark_session(
+            "Bulk Data PIPELINE",
+            BASE_HDFS
+        )
+    )
+
+    spark.conf.set(
+        "spark.scheduler.mode",
+        "FAIR"
+    )
+
+    file_types = [
+        "INV",
+        "BOR",
+        "GLCCGEN",
+        "GLCCCTA",
+        "GLCCINV"
+    ]
+
+    max_parallel_jobs = min(
+        len(file_types),
+        5
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_parallel_jobs
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                process,
+                spark,
+                file_type
+            )
+            for file_type in file_types
+        ]
+
+        for future in concurrent.futures.as_completed(
+            futures
+        ):
+            future.result()
+
+
+if __name__ == "__main__":
+    main()
