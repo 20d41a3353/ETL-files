@@ -1,0 +1,139 @@
+import datetime 
+from pyspark.sql import SparkSession , functions as F
+import pyspark.sql.types as T
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
+from pyspark.sql.functions import  to_date,expr, round, lower, col,when, length, trim,count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first, input_file_name
+from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType, DateType, TimestampType
+from datetime import date, timedelta
+from pyspark.sql.functions import desc
+import sys
+from py4j.java_gateway import java_import
+from delta.tables import DeltaTable 
+import concurrent.futures
+import builtins
+from pyspark.sql import Row
+from pyspark.sql.functions import expr, lpad, floor, concat_ws
+from pyspark.sql.functions import ltrim, col
+
+import re   
+# =========== Common Methods =============================
+from common.createSpark import create_spark_session
+from common.fileUtil import get_hdfs_base
+from datetime import datetime,date
+from common.read_write_oracle import read_oracle
+from common.create_path_if_not_exists import create_path_if_not_exists
+from pyspark.sql.functions import col, trim, substring,regexp_replace
+from collections import defaultdict
+
+
+def process(type):
+    print("INV")
+    BASE_HDFS = get_hdfs_base()
+    date_str = "11-05-2026"
+    date_obj = datetime.strptime(date_str, "%d-%m-%Y")
+    output_date = date_obj.strftime("%d-%b-%y").upper()
+
+    input_path = f"{BASE_HDFS}/CBS-FILES/{date_str}/BANCS"
+    output_path =  f"{BASE_HDFS}/data-lake/{date_str}/{type}/"
+
+
+    spark = create_spark_session("Bulk Data PIPELINE", BASE_HDFS)
+    query = f"""(select FILE_NAME from controll_file_master where ETL_DATE = '{output_date}' and FILE_TYPE ='CBS' and FILE_NAME like '{type}%') e"""
+    filenames = read_oracle(spark, query)
+    
+    # Extract the values into a list of Row objects, then pull the specific field
+    my_list = [row['FILE_NAME'] for row in filenames.select('FILE_NAME').collect()]
+    print(my_list)
+    pattern = r'^(.*?)(\d{8})_([a-zA-Z])_.*$'
+    grouped = defaultdict(list)
+    for fname in my_list:
+        match = re.match(pattern, fname)
+        if match:
+            stream = match.group(3).lower()
+            grouped[stream].append(fname)
+    all_paths = []
+    for stream, files in grouped.items():
+        paths = [f"{input_path}/{stream}/{ft}.gz" for ft in files]
+        all_paths.extend(paths)
+    print(f"{all_paths}")
+    df_raw = spark.read.format("text").load(all_paths)
+    query_parm = f"""(select * from TOTAL_DATA_PARAMETERS where FILE_TYPE ='{type}') e"""
+    parameters = read_oracle(spark, query_parm)
+    metadata = parameters.collect()
+    columns = []
+    transformed_df = df_raw
+    for row in metadata:
+       if row["TOBEINCLUDED"] == "yes":
+           column_name = row["COLUMNNAME"]
+           columns.append(column_name)
+           start_pos = int(row["STARTVALUE"])
+           end_pos = int(row["ENDVALUE"]) -1
+           length = end_pos - start_pos + 1
+           transformed_df = transformed_df.withColumn(
+               column_name,
+               trim(
+                   substring(
+                       col("value"),
+                       start_pos,
+                       length
+                   )
+               )
+           )
+    
+    transformed_df =transformed_df.drop("value")
+    
+    
+    if type == "INV":
+        cols_to_convert=["BALANCE","INT_AVAILABLE","INT_ADJUSTMENT","OD_DR_INT_AVAIL","DR_INT_ADJUSTMENT","OD_PENALTY_INT_ACCR","OD_PENALTY_INT_ADJ","OD_DR_INT_INCR","INT_INCR"]
+    if type == "BOR":
+        print("BOR")
+        cols_to_convert=["BALALANCE","LOAN_TERM","APP_AMT","ADV_VAL","COLLECTION_AMT","INT_ACCR","BPI_ACCR","CI_ACCR","INT_ADJUSTMENT","ARR_INT_ACCR","ARR_INT_ADJUSTMENT"]
+    if type in ("GLCCCTA","GLCCGEN"):
+        cols_to_convert=["AMOUNT"]
+        transformed_df = transformed_df.withColumn("ACCOUNT",lit("NA"))
+    if type == "GLCCINV":
+        cols_to_convert=["AMOUNT"]
+
+    comp1_col =["CGL_COMP_1_DR","CGL_COMP_1_CR"]
+    comp2_col =["CGL_COMP_2_DR","CGL_COMP_2_CR"]
+
+     
+    
+    for col_name in cols_to_convert:
+        transformed_df = transformed_df.withColumn(
+        col_name,
+        F.when(F.col(col_name).isNull(), None)
+        .when(
+        F.substring(F.col(col_name), -1, 1) == "-",
+        F.regexp_replace(F.col(col_name), "[-+]$", "").cast("decimal(25,4)") * -1
+        )
+        .otherwise(
+        F.regexp_replace(F.col(col_name), "[-+]$", "").cast("decimal(25,4)")
+        )
+        ).withColumn("ACCOUNT",
+        regexp_replace(col("ACCOUNT"), r"^0+", ""))
+    if type not in ("GLCCCTA","GLCCGEN","GLCCINV"):
+        for c in comp1_col:
+            transformed_df = transformed_df.withColumn(c, F.substring(F.col(c),-4,4))
+        for c in comp2_col:
+            transformed_df = transformed_df.withColumn(c, F.substring(F.col(c),-2,2))
+    transformed_df.select(*columns,"ACCOUNT")
+    
+    transformed_df.show(10,False)
+
+    
+    path = output_path
+    res = create_path_if_not_exists(spark,path)
+    print(res)
+    transformed_df.write.format("delta").mode("overwrite").save(path)
+    
+
+def main():
+    
+    types = ["INV","BOR","GLCCGEN","GLCCCTA","GLCCINV"]
+    for type in types:
+        process(type)
+
+if __name__ == "__main__":
+    main()
