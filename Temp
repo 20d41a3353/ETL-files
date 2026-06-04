@@ -1,0 +1,52 @@
+from pyspark.sql import functions as F
+from pyspark.sql.types import DecimalType
+
+
+def decode_packed_amount(raw_col: Column) -> Column:
+    """
+    Decodes a packed decimal string (16-char base + 1 sign/last-digit char).
+    Handles overpunch encoding: p-y => negative, 0-9 => positive.
+    Returns a DecimalType(25, 4) amount.
+    """
+    base       = F.substring(raw_col, 1, 16)
+    sign_char  = F.substring(raw_col, 17, 1)
+
+    # Replace overpunch chars (p-y) with their digit equivalent (0-9)
+    last_digit = F.when(
+        sign_char.rlike("[p-y]"),
+        (F.ascii(sign_char) - F.ascii(F.lit("p"))).cast("string")
+    ).otherwise(sign_char)
+
+    sign = F.when(sign_char.rlike("[p-y]"), F.lit(-1)).otherwise(F.lit(1))
+
+    full_str = F.concat(base, last_digit)
+
+    return (full_str.cast(DecimalType(25, 4)) / 1000) * sign
+
+
+# ── Column definitions ────────────────────────────────────────────────────────
+# Map: output_col_name -> raw source column expression
+AMOUNT_COLS: dict[str, Column] = {
+    "AMOUNT":         F.when(F.col("currency_code") != "INR", F.col("FCY_AMT"))
+                       .otherwise(F.col("LCY_AMT")),
+
+    # Add more amount columns here, e.g.:
+    # "TAX_AMOUNT":   F.col("TAX_RAW"),
+    # "NET_AMOUNT":   F.col("NET_RAW"),
+}
+
+# ── Single-pass withColumns ───────────────────────────────────────────────────
+df_final = df_processed.withColumns({
+    out_col: decode_packed_amount(raw_expr)
+    for out_col, raw_expr in AMOUNT_COLS.items()
+})
+
+AMOUNT_COLS: dict[str, Column] = {
+    "AMOUNT":      F.when(F.col("currency_code") != "INR", F.col("FCY_AMT")).otherwise(F.col("LCY_AMT")),
+    "TAX_AMOUNT":  F.col("TAX_RAW"),
+    "NET_AMOUNT":  F.col("NET_RAW"),
+    "CHARGE_AMT":  F.col("CHG_RAW"),
+}
+
+
+
