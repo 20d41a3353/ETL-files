@@ -1,52 +1,89 @@
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType
 
+# Create digit mapping once
+digit_map = F.create_map(
+    *[x for pair in [
+        (F.lit('0'), F.lit('0')),
+        (F.lit('1'), F.lit('1')),
+        (F.lit('2'), F.lit('2')),
+        (F.lit('3'), F.lit('3')),
+        (F.lit('4'), F.lit('4')),
+        (F.lit('5'), F.lit('5')),
+        (F.lit('6'), F.lit('6')),
+        (F.lit('7'), F.lit('7')),
+        (F.lit('8'), F.lit('8')),
+        (F.lit('9'), F.lit('9')),
+        (F.lit('p'), F.lit('0')),
+        (F.lit('q'), F.lit('1')),
+        (F.lit('r'), F.lit('2')),
+        (F.lit('s'), F.lit('3')),
+        (F.lit('t'), F.lit('4')),
+        (F.lit('u'), F.lit('5')),
+        (F.lit('v'), F.lit('6')),
+        (F.lit('w'), F.lit('7')),
+        (F.lit('x'), F.lit('8')),
+        (F.lit('y'), F.lit('9'))
+    ] for x in pair]
+)
 
-def decode_packed_amount(raw_col: Column) -> Column:
-    """
-    Decodes a packed decimal string (16-char base + 1 sign/last-digit char).
-    Handles overpunch encoding: p-y => negative, 0-9 => positive.
-    Returns a DecimalType(25, 4) amount.
-    """
-    base       = F.substring(raw_col, 1, 16)
-    sign_char  = F.substring(raw_col, 17, 1)
-
-    # Replace overpunch chars (p-y) with their digit equivalent (0-9)
-    last_digit = F.when(
-        sign_char.rlike("[p-y]"),
-        (F.ascii(sign_char) - F.ascii(F.lit("p"))).cast("string")
-    ).otherwise(sign_char)
-
-    sign = F.when(sign_char.rlike("[p-y]"), F.lit(-1)).otherwise(F.lit(1))
-
-    full_str = F.concat(base, last_digit)
-
-    return (full_str.cast(DecimalType(25, 4)) / 1000) * sign
+negative_chars = ['p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y']
 
 
-# ── Column definitions ────────────────────────────────────────────────────────
-# Map: output_col_name -> raw source column expression
-AMOUNT_COLS: dict[str, Column] = {
-    "AMOUNT":         F.when(F.col("currency_code") != "INR", F.col("FCY_AMT"))
-                       .otherwise(F.col("LCY_AMT")),
+def decode_signed_amount(col_name):
+    sign_char = F.substring(F.col(col_name), -1, 1)
 
-    # Add more amount columns here, e.g.:
-    # "TAX_AMOUNT":   F.col("TAX_RAW"),
-    # "NET_AMOUNT":   F.col("NET_RAW"),
-}
+    amount_str = F.concat(
+        F.substring(F.col(col_name), 1, F.length(F.col(col_name)) - 1),
+        digit_map[sign_char]
+    )
 
-# ── Single-pass withColumns ───────────────────────────────────────────────────
-df_final = df_processed.withColumns({
-    out_col: decode_packed_amount(raw_expr)
-    for out_col, raw_expr in AMOUNT_COLS.items()
-})
+    sign = F.when(sign_char.isin(negative_chars), -1).otherwise(1)
 
-AMOUNT_COLS: dict[str, Column] = {
-    "AMOUNT":      F.when(F.col("currency_code") != "INR", F.col("FCY_AMT")).otherwise(F.col("LCY_AMT")),
-    "TAX_AMOUNT":  F.col("TAX_RAW"),
-    "NET_AMOUNT":  F.col("NET_RAW"),
-    "CHARGE_AMT":  F.col("CHG_RAW"),
-}
+    return (
+        amount_str.cast(DecimalType(25, 4))
+        .divide(F.lit(1000))
+        * sign
+    )
+
+
+
+
+amount_cols = [
+    "FCY_AMT",
+    "LCY_AMT",
+    "TAX_AMT",
+    "FEE_AMT",
+    "NET_AMT"
+]
+
+df_final = df_processed.select(
+    "*",
+    *[
+        decode_signed_amount(c).alias(f"{c}_DECIMAL")
+        for c in amount_cols
+    ]
+)
+
+
+df_final = (
+    df_processed
+    .withColumn(
+        "Amount_raw",
+        F.when(
+            F.col("currency_code") != "INR",
+            F.col("FCY_AMT")
+        ).otherwise(F.col("LCY_AMT"))
+    )
+    .withColumn(
+        "AMOUNT",
+        decode_signed_amount("Amount_raw")
+    )
+)
+
+
+
+
 
 
 
