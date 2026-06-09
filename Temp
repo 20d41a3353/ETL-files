@@ -1,89 +1,47 @@
-from pyspark.sql import functions as F
-from pyspark.sql.types import DecimalType
+from pyspark.sql.functions import col, lit
 
-# Create digit mapping once
-digit_map = F.create_map(
-    *[x for pair in [
-        (F.lit('0'), F.lit('0')),
-        (F.lit('1'), F.lit('1')),
-        (F.lit('2'), F.lit('2')),
-        (F.lit('3'), F.lit('3')),
-        (F.lit('4'), F.lit('4')),
-        (F.lit('5'), F.lit('5')),
-        (F.lit('6'), F.lit('6')),
-        (F.lit('7'), F.lit('7')),
-        (F.lit('8'), F.lit('8')),
-        (F.lit('9'), F.lit('9')),
-        (F.lit('p'), F.lit('0')),
-        (F.lit('q'), F.lit('1')),
-        (F.lit('r'), F.lit('2')),
-        (F.lit('s'), F.lit('3')),
-        (F.lit('t'), F.lit('4')),
-        (F.lit('u'), F.lit('5')),
-        (F.lit('v'), F.lit('6')),
-        (F.lit('w'), F.lit('7')),
-        (F.lit('x'), F.lit('8')),
-        (F.lit('y'), F.lit('9'))
-    ] for x in pair]
-)
+# control_df -> FILE_NAME, HDFS_ROW_COUNT
+# file_count_df -> FILE_NAME, ROW_COUNT
 
-negative_chars = ['p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y']
-
-
-def decode_signed_amount(col_name):
-    sign_char = F.substring(F.col(col_name), -1, 1)
-
-    amount_str = F.concat(
-        F.substring(F.col(col_name), 1, F.length(F.col(col_name)) - 1),
-        digit_map[sign_char]
+comparison_df = (
+    control_df.alias("c")
+    .join(
+        file_count_df.alias("f"),
+        ["FILE_NAME"],
+        "full_outer"
     )
-
-    sign = F.when(sign_char.isin(negative_chars), -1).otherwise(1)
-
-    return (
-        amount_str.cast(DecimalType(25, 4))
-        .divide(F.lit(1000))
-        * sign
-    )
-
-
-
-
-amount_cols = [
-    "FCY_AMT",
-    "LCY_AMT",
-    "TAX_AMT",
-    "FEE_AMT",
-    "NET_AMT"
-]
-
-df_final = df_processed.select(
-    "*",
-    *[
-        decode_signed_amount(c).alias(f"{c}_DECIMAL")
-        for c in amount_cols
-    ]
-)
-
-
-df_final = (
-    df_processed
-    .withColumn(
-        "Amount_raw",
-        F.when(
-            F.col("currency_code") != "INR",
-            F.col("FCY_AMT")
-        ).otherwise(F.col("LCY_AMT"))
-    )
-    .withColumn(
-        "AMOUNT",
-        decode_signed_amount("Amount_raw")
+    .select(
+        col("FILE_NAME"),
+        col("c.HDFS_ROW_COUNT"),
+        col("f.ROW_COUNT"),
+        (col("f.ROW_COUNT") - col("c.HDFS_ROW_COUNT")).alias("DIFFERENCE")
     )
 )
 
+mismatch_df = comparison_df.filter(
+    (col("HDFS_ROW_COUNT").isNull()) |
+    (col("ROW_COUNT").isNull()) |
+    (col("HDFS_ROW_COUNT") != col("ROW_COUNT"))
+)
 
+report_path = f"{BASE_HDFS}/audit/GLIF_ROWCOUNT_REPORT_{date_str}"
 
+if mismatch_df.rdd.isEmpty():
 
+    spark.createDataFrame(
+        [("SUCCESS : ALL FILES ROW COUNT MATCHED",)],
+        ["REPORT_LINE"]
+    ).coalesce(1).write.mode("overwrite").text(report_path)
 
+else:
 
-
+    mismatch_df.selectExpr(
+        """
+        concat(
+            'FILE_NAME=', FILE_NAME,
+            ' | CONTROL_COUNT=', cast(HDFS_ROW_COUNT as string),
+            ' | ACTUAL_COUNT=', cast(ROW_COUNT as string),
+            ' | DIFFERENCE=', cast(DIFFERENCE as string)
+        ) as REPORT_LINE
+        """
+    ).coalesce(1).write.mode("overwrite").text(report_path)
