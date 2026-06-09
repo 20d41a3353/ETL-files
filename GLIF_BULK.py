@@ -1,9 +1,9 @@
 import datetime 
 from pyspark.sql import SparkSession , functions as F
 import pyspark.sql.types as T
-
+import os
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
-from pyspark.sql.functions import  to_date,expr, round, lower, col,when, length, trim,count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first, input_file_name
+from pyspark.sql.functions import  to_date,expr, round, lower, col,when, length, trim,count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first, input_file_name,substring_index
 from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType, DateType, TimestampType
 from datetime import date, timedelta
 from pyspark.sql.functions import desc
@@ -12,6 +12,7 @@ from py4j.java_gateway import java_import
 from delta.tables import DeltaTable 
 import concurrent.futures
 import builtins
+
 from pyspark.sql import Row
 from pyspark.sql.functions import expr, lpad, floor, concat_ws
 from pyspark.sql.functions import ltrim, col
@@ -49,14 +50,16 @@ def main(etl_date):
     # +++++++++++++++++++++++++++++++++++++++++++
     output_path =  f"{BASE_HDFS}/druid-data-lake/{date_str}/GLIF/"
     input_path = f"{BASE_HDFS}/CBS-FILES/{date_str}/GLIF"
-    
+
+
+    control_file_master =f"{BASE_HDFS}/druid-data-lake/{date_str}/GLIF_CFM"
 
     spark = create_spark_session("Bulk Data PIPELINE", BASE_HDFS)
-    query = f"""(select FILE_NAME from controll_file_master where ETL_DATE = '{output_date}' and FILE_TYPE ='GLIF' and hdfs_row_count >0 ) e"""
-    filenames = read_oracle(spark, query)
-    # filenames.show(20,False)
+    query = f"""(select FILE_NAME,HDFS_ROW_COUNT from controll_file_master where ETL_DATE = '{output_date}' and FILE_TYPE ='GLIF'  ) e"""
+    control_file_master_df = read_oracle(spark, query)
     # Extract the values into a list of Row objects, then pull the specific field
-    my_list = [row['FILE_NAME'] for row in filenames.select('FILE_NAME').collect()]
+    my_list = [row['FILE_NAME'] for row in control_file_master_df.select('FILE_NAME').collect()]
+
 
 
     pattern = r'^(.*?)(\d{8})_([a-zA-Z])_.*$'
@@ -77,11 +80,91 @@ def main(etl_date):
     # all_paths = read_patterns(spark,all_paths)
    
     # print(f"{all_paths}")
-    df_raw = spark.read.format("text").load(all_paths)
+    df_raw = spark.read.format("text").load(all_paths).withColumn("File_name", regexp_replace(substring_index(input_file_name(), "/",-1), r"\.gz$",""))
+    
+    file_count_df = df_raw.groupBy("FILE_NAME").agg(count("*").alias("ROW_COUNT"))
+
+    
+    from pyspark.sql.functions import col, lit
+
+    comparison_df = (
+        control_file_master_df.alias("c")
+        .join(
+            file_count_df.alias("f"),
+            ["FILE_NAME"],
+            "full_outer"
+        )
+        .select(
+            col("FILE_NAME"),
+            col("c.HDFS_ROW_COUNT"),
+            col("f.ROW_COUNT"),
+            (col("f.ROW_COUNT") - col("c.HDFS_ROW_COUNT")).alias("DIFFERENCE")
+        )
+    )
+
+    mismatch_df = comparison_df.filter(
+        (col("HDFS_ROW_COUNT").isNull()) |
+        (col("ROW_COUNT").isNull()) |
+        (col("HDFS_ROW_COUNT") != col("ROW_COUNT"))
+    )
+
+    create_path_if_not_exists(spark,control_file_master)
+    if mismatch_df.rdd.isEmpty():
+
+        matched = spark.createDataFrame(
+            [("SUCCESS : ALL FILES ROW COUNT MATCHED",)],
+            ["REPORT_LINE"]
+        )
+        matched.coalesce(1).write.mode("overwrite").text(control_file_master)
+
+    else:
+
+        mismatch_df.selectExpr(
+            """
+            concat(
+                'FILE_NAME=', FILE_NAME,
+                ' | CONTROL_COUNT=', cast(HDFS_ROW_COUNT as string),
+                ' | ACTUAL_COUNT=', cast(ROW_COUNT as string),
+                ' | DIFFERENCE=', cast(DIFFERENCE as string)
+            ) as REPORT_LINE
+            """
+        ).coalesce(1).write.mode("overwrite").text(control_file_master)
+
+        sc = spark.sparkContext
+        # 1. Setup Hadoop FileSystem Access
+        jvm = sc._jvm
+        jsc = sc._jsc
+        fs = jvm.org.apache.hadoop.fs.FileSystem.get(jsc.hadoopConfiguration())
+        Path = jvm.org.apache.hadoop.fs.Path
+
+        manifest_filename = f"MisMatched_Count.txt"
+        dest_file_path = spark._jvm.Path(f"{control_file_master}/{manifest_filename}")
+
+        def df_to_show_string(df,  max_rows=10000):
+            count = df.count()
+            table = df._jdf.showString(count, 50, False)
+            return  table
+        mismatch_df = df_to_show_string(mismatch_df)
+        
+
+        # 4. Ensure HDFS directory exists
+        hdfs_dir_obj = spark._jvm.Path(control_file_master)
+        if not fs.exists(hdfs_dir_obj):
+            fs.mkdirs(hdfs_dir_obj)
+
+ 
+        out_stream = fs.create(dest_file_path, True)
+        out_stream.write(bytearray(mismatch_df, "utf-8"))
+        out_stream.close()
+        
+
+
+       
+       
+
 
     query_parm = f"""(select * from FILE_DATA_PARAMETERS where FILE_TYPE ='GLIF' ) e"""
     parameters = read_oracle(spark, query_parm)
-    parameters.show(20,False)
 
     metadata = parameters.collect()
     
@@ -189,7 +272,6 @@ def main(etl_date):
     
 
     transformed_df = transformed_df.withColumn("AMOUNT", (col("AMOUNT").cast("decimal(25, 4)"))).withColumn("FCY_AMT", (col("FCY_AMT").cast("decimal(25, 4)"))).withColumn("LCY_AMT", (col("LCY_AMT").cast("decimal(25, 4)")))
-    transformed_df.show(20,False)
 
 
 
@@ -198,6 +280,7 @@ def main(etl_date):
     res = create_path_if_not_exists(spark,path)
     print(res)
     transformed_df.write.format("delta").mode("overwrite").save(path)
+    
 
 
 
@@ -218,5 +301,5 @@ if __name__ == "__main__":
     
     print(generated_dates)
 
-    # for etl_date in generated_dates:
-        # main(etl_date)
+    for etl_date in generated_dates:
+        main(etl_date)
