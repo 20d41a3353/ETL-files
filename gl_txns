@@ -1,0 +1,924 @@
+import datetime 
+from pyspark.sql import SparkSession , functions as F
+import pyspark.sql.types as T
+import os
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
+from pyspark.sql.functions import  to_date,expr, round, lower, col,when, length, trim,count, substring,trim, concat, lit, create_map, to_timestamp, sum,broadcast, coalesce,current_timestamp, first, input_file_name,substring_index
+from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType, DateType, TimestampType
+from datetime import date, timedelta
+from pyspark.sql.functions import desc
+import sys
+from py4j.java_gateway import java_import
+from delta.tables import DeltaTable 
+import concurrent.futures
+import builtins
+
+from pyspark.sql import Row
+from pyspark.sql.functions import expr, lpad, floor, concat_ws
+from pyspark.sql.functions import ltrim, col
+from common.create_path_if_not_exists import create_path_if_not_exists
+from common.pattern import read_patterns
+import re   
+from functools import reduce
+from pyspark.sql.functions import col, substring, when, expr, ascii
+# =========== Common Methods =============================
+from common.check_monthend import check_MonthEnd,check_year_end
+from common.createSpark import create_spark_session
+from common.fileUtil import get_hdfs_base
+from common.properties import get_oracle_properties
+from datetime import datetime,date
+from common.read_write_oracle import read_oracle
+from common.log_etl_modified import log_etl
+from common.constants import Process
+from common.processRun import get_run_id
+from common.logger import setup_logger 
+from common.dateUtil import get_etl_date
+from common.processRun import get_process_run_id
+
+from pyspark.sql.functions import col, trim, substring,regexp_replace
+from collections import defaultdict
+def main(spark,BASE_HDFS,etl_date):
+    print("hello update")
+
+    try:
+        date_str = etl_date
+
+        date_obj = datetime.strptime(date_str, "%d-%m-%Y")   
+        year = date_obj.strftime("%Y")
+        month = date_obj.strftime("%b").upper()
+        day = date_obj.strftime("%d")
+        output_date = date_obj.strftime("%d-%b-%y").upper()
+        print(output_date)
+
+        today = get_etl_date(spark) 
+        today= today.strftime("%Y-%m-%d")
+        posting_date_str = today.strftime("%Y-%m-%d")
+
+        PROCESS_ID= Process.GLIF_PIPELINE
+        RUN_ID = get_run_id(spark,today,PROCESS_ID) 
+        logger = setup_logger("GLIF", RUN_ID , posting_date_str)
+        process_run_id = sys.argv[1] if len(sys.argv) > 1 else get_process_run_id(spark,PROCESS_ID,today)
+        log_etl(spark, process_run_id, "GLIF_Bulk_pipeline_started",1)
+
+        log_etl(spark, process_run_id, f"source_dir_check", 2, f"Source dir : exists")
+        log_etl(spark, process_run_id, f"source_dir_check", 3, f"Error: {e}")
+
+        # +++++++++++++++++++++++++++++++++++++++++++
+        # +++++++++++++ PATHS +++++++++++++++++++++++ 121483603
+        # +++++++++++++++++++++++++++++++++++++++++++
+        output_path =  f"{BASE_HDFS}/druid-data-lake/{year}/{month}/{day}/GLIF/"
+        input_path = f"{BASE_HDFS}/CBS-FILES/{date_str}/GLIF"
+        spark = create_spark_session("Bulk Data PIPELINE", BASE_HDFS)
+
+    except Exception as e:
+        print(f"Error {e} occured")
+
+    try:
+        log_etl(spark, process_run_id, "Validating_Paths_in_HDFS",1)
+
+        query = f"""(select FILE_NAME,HDFS_ROW_COUNT from controll_file_master where ETL_DATE = '{output_date}' and FILE_TYPE ='GLIF' and HDFS_ROW_COUNT > 0 ) e"""
+        control_file_master_df = read_oracle(spark, query)    
+        # control_file_master_df.show(20,False)
+
+    
+        ## Extract the values into a list of Row objects, then pull the specific field
+        my_list = [row['FILE_NAME'] for row in control_file_master_df.select('FILE_NAME').collect()]
+
+        if  len(my_list)==0:
+            print(f"------------->Stopping Pipeline because control file master has no data for selected date - {output_date} .<--------------")
+            spark.stop()
+            sys.exit()
+
+        pattern = r'^(.*?)(\d{8})_([a-zA-Z]).*$'
+
+        grouped = defaultdict(list)
+
+        for fname in my_list:
+            match = re.match(pattern, fname)
+            if match:
+                stream = match.group(3)
+                grouped[stream].append(fname)
+    
+        all_paths = []
+        for stream, files in grouped.items():
+            paths = [f"{input_path}/{stream}/{ft}.gz" for ft in files]
+            all_paths.extend(paths)
+
+        found_paths,unfound_paths = read_patterns(spark,all_paths)
+
+        print(f"{found_paths}")
+        log_etl(spark, process_run_id, "Validating_Paths_in_HDFS",2,"Sucessfully Validated")
+    except Exception as e:
+        print(f"Error {e} occured while processing {query} data.")
+        log_etl(spark, process_run_id, "Validating_Paths_in_HDFS",3,f"Failed to Validated due to {e}")
+
+
+
+    try:
+        log_etl(spark, process_run_id, "Reading_Files",1)
+        df_raw = spark.read.format("text").load(found_paths).withColumn("FILE_NAME", regexp_replace(substring_index(input_file_name(), "/",-1), r"\.gz$",""))
+
+        file_count_df = df_raw.groupBy("FILE_NAME").agg(count("*").alias("ROW_COUNT"))
+        log_etl(spark, process_run_id, "Reading_Files",2,"Sucessfully Read Files")
+    except Exception as e:
+        print(f"Error {e} while reading the data from datalake path.")
+        log_etl(spark, process_run_id, "Reading_Files",3,f"Error {e} While Reading Files")
+
+    try:
+        log_etl(spark, process_run_id, "updating_control_file_master",1)
+        comparison_df = (
+            control_file_master_df.alias("c")
+            .join(
+                file_count_df.alias("f"),
+                ["FILE_NAME"],
+                "full_outer"
+            )
+            .select(
+                col("FILE_NAME"),
+                col("c.HDFS_ROW_COUNT").cast("decimal(25)"),
+                col("f.ROW_COUNT").alias("DATA_LAKE_COUNT")
+            )
+        )
+        comparison_df =comparison_df.withColumn("DATA_LAKE_STATUS",
+                                                F.when(col("HDFS_ROW_COUNT")==col("DATA_LAKE_COUNT"),"YES")
+                                                )
+        existing_files_count = comparison_df.filter(col("DATA_LAKE_COUNT").isNotNull() & col("DATA_LAKE_STATUS").isNotNull())
+
+        unmatched_files = comparison_df.filter(col("DATA_LAKE_COUNT").isNull() | col("DATA_LAKE_STATUS").isNull() | col("DATA_LAKE_STATUS").isNull())
+        unmatch_count = unmatched_files.count()
+        missing_unmatch = unmatched_files._jdf.showString(20, 20, False)
+
+        oracle_properties = get_oracle_properties()
+        conn = spark._sc._gateway.jvm.java.sql.DriverManager.getConnection(
+            oracle_properties["url"],
+            oracle_properties["user"],
+            oracle_properties["password"]
+        )
+        conn.setAutoCommit(False)
+        update_sql = """
+        UPDATE CONTROLL_FILE_MASTER
+        SET DATA_LAKE_COUNT = ?,
+            DATA_LAKE_STATUS = ?
+        WHERE FILE_NAME = ?
+        AND ETL_DATE = ?
+        """
+        stmt = conn.prepareStatement(update_sql)
+        for row in existing_files_count.collect():
+            stmt.setInt(1, int(row["DATA_LAKE_COUNT"]))
+            stmt.setString(2, row["DATA_LAKE_STATUS"])
+            stmt.setString(3, row["FILE_NAME"])
+            stmt.setString(4, output_date)
+            stmt.addBatch()
+        stmt.executeBatch()
+        conn.commit()
+        stmt.close()
+        conn.close()
+        log_etl(spark, process_run_id, "updating_control_file_master",2,f"Sucessfully updated the Control File Master Table.")
+    except Exception as e:
+        print(f"Error {e} occured")
+        log_etl(spark, process_run_id, "updating_control_file_master",3,f"Error {e} While updating the Control File Master Table.")
+
+
+    try:
+        log_etl(spark, process_run_id, "Filtering_raw_data",1)
+        query_parm = f"""(select * from FILE_DATA_PARAMETERS where FILE_TYPE ='GLIF' ) e"""
+        parameters = read_oracle(spark, query_parm)
+
+        metadata = parameters.collect()
+
+        transformed_df = df_raw
+        columns = []
+        for row in metadata:
+           if row["TO_BE_INCLUDED"] == "yes":
+               column_name = row["COLUMN_NAME"]
+
+               columns.append(column_name)
+               start_pos = int(row["START_POSITION"])
+               end_pos = int(row["END_POSITION"]) -1
+               length = end_pos - start_pos + 1
+               transformed_df = transformed_df.withColumn(
+                   column_name,
+                   trim(
+                       substring(
+                           col("value"),
+                           start_pos,
+                           length
+                       )
+                   )
+               )
+        print(columns)
+        log_etl(spark, process_run_id, "Filtering_raw_data",2,"Sucessfully filtered the data.")
+
+    except Exception as e:
+        print(f"Error {e} occured.")
+        log_etl(spark, process_run_id, "Filtering_raw_data",3,"Error {e} occured while filtering the data.")
+    try:
+
+        log_etl(spark, process_run_id, "data_transformation",1)  
+        transformed_df =transformed_df.drop("value")    
+        transformed_df = transformed_df.withColumn(
+            "POST_DATE", 
+            expr("date_add(to_date('1899-12-31'), cast(POST_DATE as int))")
+            ).withColumn(
+                "TRANS_DATE", 
+                expr("date_add(to_date('1899-12-31'), cast(TRANS_DATE as int))")
+                ).withColumn(
+                        "POST_TIME",
+                        concat(col("POST_DATE"),lit(" "),
+                               expr("""
+                                    concat(
+                                    lpad(cast(floor(POST_TIME / 3600000) as string), 2, '0'),
+                                    ':',
+                                    lpad(cast(floor((POST_TIME % 3600000) / 60000) as string), 2, '0'),
+                                    ':',
+                                    lpad(cast(floor((POST_TIME % 60000) / 1000) as string), 2, '0')
+                                    )"""))
+                                    ).withColumn(
+                                        "ACCOUNT",
+                                         regexp_replace(col("ACCOUNT"), r"^0+", ""))
+
+        # Create digit mapping once
+        digit_map = F.create_map(
+            *[x for pair in [
+                (F.lit('0'), F.lit('0')),(F.lit('1'), F.lit('1')),(F.lit('2'), F.lit('2')),(F.lit('3'), F.lit('3')),(F.lit('4'), F.lit('4')),
+                (F.lit('5'), F.lit('5')),(F.lit('6'), F.lit('6')),(F.lit('7'), F.lit('7')),(F.lit('8'), F.lit('8')),(F.lit('9'), F.lit('9')),
+                (F.lit('p'), F.lit('0')),(F.lit('q'), F.lit('1')),(F.lit('r'), F.lit('2')),(F.lit('s'), F.lit('3')),(F.lit('t'), F.lit('4')),
+                (F.lit('u'), F.lit('5')),(F.lit('v'), F.lit('6')),(F.lit('w'), F.lit('7')),(F.lit('x'), F.lit('8')),(F.lit('y'), F.lit('9'))
+            ] for x in pair]
+        )
+
+        negative_chars = ['p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y']
+
+
+        def decode_signed_amount(col_name):
+            sign_char = F.substring(F.col(col_name), -1, 1)
+
+            amount_str = F.concat(
+                # F.substring(F.col(col_name), 1, F.length(F.col(col_name)) - 1),
+                F.expr(f"substring({col_name}, 1, length({col_name})-1)"),
+                digit_map[sign_char]
+            )
+
+            sign = F.when(sign_char.isin(negative_chars), -1).otherwise(1)
+
+            return (
+                amount_str.cast("decimal(25, 4)")/1000 * sign
+            )
+
+        amount_cols = [
+            "FCY_AMT",
+            "LCY_AMT",        
+        ]
+
+        transformed_df = transformed_df.select(
+            *[
+                decode_signed_amount(c).alias(c)
+                if c in amount_cols
+                else F.col(c)
+                for c in transformed_df.columns
+            ],"FILE_NAME"
+        )
+
+        transformed_df = transformed_df.withColumns({
+            "AMOUNT": when(
+                col("FCY_CODE") != "INR",
+                col("FCY_AMT")
+            ).otherwise(col("LCY_AMT"))
+        })
+
+        transformed_df = transformed_df.select(*columns,"AMOUNT","FILE_NAME")
+
+        transformed_df = transformed_df.withColumn("AMOUNT", (col("AMOUNT").cast("decimal(25, 4)"))).withColumn("FCY_AMT", (col("FCY_AMT").cast("decimal(25, 4)"))).withColumn("LCY_AMT", (col("LCY_AMT").cast("decimal(25, 4)")))
+        log_etl(spark, process_run_id, "data_transformation",2,"Successfully Transformed the data")  
+
+    except Exception as e:
+        print(f"Error {e} occured while transforming the Raw data")
+        log_etl(spark, process_run_id, "data_transformation",3,f"Error {e} while Transforming the data.")  
+
+
+    try:
+        log_etl(spark, process_run_id, "writing_to_datalake",1)  
+
+        path = f"{output_path}/GLIF_TXNS"
+        res = create_path_if_not_exists(spark,path)
+        print(res)
+        # transformed_df.show(20,False)
+        transformed_df.write.format("delta").mode("overwrite").save(path)
+        rows = transformed_df.count()
+        print(f"Number od rows in Glif Datalake {path}===========  >>>>>>>>>>>>  {rows}") #  
+        log_etl(spark, process_run_id, "writing_to_datalake",2,"Successfully written to datalake")  
+
+    except Exception as e:
+        print(f"Error {e} occured ")
+        log_etl(spark, process_run_id, "writing_to_datalake",3,f"Error {e} occured while writing to datalake")  
+
+    try:
+        java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+        java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+        fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+        hdfs_dir = f"{output_path}"    
+        manifest_filename = f"MissingPath_{len(unfound_paths)}_RowDiffCount_{unmatch_count}_TotalRows_{rows}.txt"
+        dest_file_path = spark._jvm.Path(f"{hdfs_dir}/{manifest_filename}")
+        hdfs_dir_obj = spark._jvm.Path(hdfs_dir)
+        if not fs.exists(hdfs_dir_obj):
+            fs.mkdirs(hdfs_dir_obj)
+        out_stream = fs.create(dest_file_path, True)
+        unfound_paths= ", ".join([f"'{x}'" for x in unfound_paths])
+
+        text_file = unfound_paths +"\n"+ missing_unmatch
+        print(text_file)
+        out_stream.write(bytearray(text_file, "utf-8"))
+        out_stream.close()
+    except Exception as e:
+        print(f"Error {e} occured ")
+    
+    
+    
+
+
+if __name__ == "__main__":
+    try:
+
+        BASE_HDFS = get_hdfs_base()
+        spark = create_spark_session("Bulk Data PIPELINE", BASE_HDFS)
+        # today = get_etl_date(spark)
+        # posting_date_str = today.strftime("%d-%m-%Y")
+        # dates = [posting_date_str, posting_date_str]
+
+        date_format = "%d-%m-%Y"
+        dates = ["12-03-2026","12-03-2026"] 
+        dates = ["01-06-2026","01-06-2026"] 
+
+        start_date = datetime.strptime(dates[0], date_format)
+        end_date = datetime.strptime(dates[1], date_format)
+
+        generated_dates = []
+    
+        current_date = start_date
+
+        while current_date <= end_date:       
+            generated_dates.append(current_date.strftime(date_format))        
+            current_date += timedelta(days=1)
+
+        print(generated_dates)
+
+        for etl_date in generated_dates:
+            main(spark,BASE_HDFS,etl_date)
+
+    except Exception as e:
+        print("Error {e} occured.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    #      # if check_MonthEnd():
+    # #     print("month-end File")
+    # #     frequency = "M"
+    # # if check_year_end(spark):
+    # #     print("year-end files")
+    # #     frequency = "Y"
+    # # else:
+    # #     print("Daily files")
+    # #     frequency = "D"
+
+    # # query = f"""(Select * from file_type_master where type='glif' and FREQUENCY like '%{frequency}%') e"""
+    # # file_type_master_df = read_oracle(spark, query)
+    
+    # query = f"""(select FILE_NAME,HDFS_ROW_COUNT from controll_file_master where ETL_DATE = '{output_date}' and FILE_TYPE ='GLIF' and HDFS_ROW_COUNT > 0 ) e"""
+    # control_file_master_df = read_oracle(spark, query)
+    
+    
+    # # control_file_master_df= control_file_master_df.withColumn(
+    # # "FILE_PATTERNS", 
+    # # F.regexp_extract(F.col("FILE_NAME"), r'^(.*?)_(\d{8})_([a-zA-Z])_.*$', 1))
+
+    
+
+    # # control_file_master_df = control_file_master_df.join(
+    # #         broadcast(file_type_master_df.select(F.col("FILE_PATTERN").alias("FILE_PATTERNS")).withColumn("valid", F.lit(1))),
+    # #         on="FILE_PATTERNS",
+    # #         how="left"
+    # #     )
+    # # control_file_master_df=control_file_master_df.filter(F.col("valid")==1)
+    
+    # ## Extract the values into a list of Row objects, then pull the specific field
+    # my_list = [row['FILE_NAME'] for row in control_file_master_df.select('FILE_NAME').collect()]
+
+
+
+    # pattern = r'^(.*?)(\d{8})_([a-zA-Z]).*$'
+
+    # grouped = defaultdict(list)
+
+    # for fname in my_list:
+    #     match = re.match(pattern, fname)
+    #     if match:
+    #         stream = match.group(3)
+    #         grouped[stream].append(fname)
+	
+    # all_paths = []
+    # for stream, files in grouped.items():
+    #     paths = [f"{input_path}/{stream}/{ft}.gz" for ft in files]
+    #     all_paths.extend(paths)
+
+    # all_paths = read_patterns(spark,all_paths)
+   
+    # print(f"{all_paths}")
+    # df_raw = spark.read.format("text").load(all_paths).withColumn("FILE_NAME", regexp_replace(substring_index(input_file_name(), "/",-1), r"\.gz$",""))
+    
+    # # file_count_df = df_raw.groupBy("FILE_NAME").agg(count("*").alias("ROW_COUNT"))
+
+    # # file_count_df.cache()
+    # # from pyspark.sql.functions import col, lit
+
+    # # comparison_df = (
+    # #     control_file_master_df.alias("c")
+    # #     .join(
+    # #         file_count_df.alias("f"),
+    # #         ["FILE_NAME"],
+    # #         "full_outer"
+    # #     )
+    # #     .select(
+    # #         col("FILE_NAME"),
+    # #         col("c.HDFS_ROW_COUNT"),
+    # #         col("f.ROW_COUNT"),
+    # #         (col("f.ROW_COUNT") - col("c.HDFS_ROW_COUNT")).alias("DIFFERENCE")
+    # #     )
+    # # )
+
+    # # mismatch_df = comparison_df.filter(
+    # #     (col("HDFS_ROW_COUNT").isNull()) |
+    # #     (col("ROW_COUNT").isNull()) |
+    # #     (col("HDFS_ROW_COUNT") != col("ROW_COUNT"))
+    # # )
+    # # miscount = mismatch_df.select(col("FILE_NAME")).count()
+
+    # # java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+    # # java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+    # # fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+
+    # # first_row = mismatch_df.head(1)
+    # # if not first_row:
+    # #     matched = "SUCCESS : ALL FILES ROW COUNT MATCHED"
+    # #     hdfs_dir = f"{control_file_master}"
+    # #     manifest_filename = f"miscount_ZERO.txt"
+    # #     dest_file_path = spark._jvm.Path(f"{hdfs_dir}/{manifest_filename}")
+
+    # #     hdfs_dir_obj = spark._jvm.Path(hdfs_dir)
+    # #     if not fs.exists(hdfs_dir_obj):
+    # #         fs.mkdirs(hdfs_dir_obj)
+        
+    # #     out_stream = fs.create(dest_file_path, True)
+    # #     out_stream.write(bytearray(matched, "utf-8"))
+    # #     out_stream.close()
+        
+
+    # # else:
+               
+    # #     print(f"{control_file_master} -=================================> is the path to write the mis-match count of rows")
+    # #     create_path_if_not_exists(spark,control_file_master)
+    # #     mismatch_df=mismatch_df.withColumn("HDFS_ROW_COUNT", (col("HDFS_ROW_COUNT").cast("decimal(25, 0)"))).withColumn("DIFFERENCE", (col("DIFFERENCE").cast("decimal(25, 0)")))
+                           
+    # #     def df_to_show_string(df,  max_rows=10000):
+    # #         count = df.count()
+    # #         table = df._jdf.showString(count, 50, False)
+    # #         return  table
+
+    # #     missing_txt_final = df_to_show_string(mismatch_df)
+        
+
+    # #     hdfs_dir = f"{control_file_master}"    
+
+    # #     manifest_filename = f"miscount_{miscount}.txt"
+    # #     dest_file_path = spark._jvm.Path(f"{hdfs_dir}/{manifest_filename}")
+
+    # #     hdfs_dir_obj = spark._jvm.Path(hdfs_dir)
+    # #     if not fs.exists(hdfs_dir_obj):
+    # #         fs.mkdirs(hdfs_dir_obj)
+        
+    # #     out_stream = fs.create(dest_file_path, True)
+    # #     out_stream.write(bytearray(missing_txt_final, "utf-8"))
+    # #     out_stream.close()
